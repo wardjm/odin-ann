@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  # The Odin commit the library is developed against. Odin has no stable
+  # releases, so bump this deliberately (and fix any breakage) rather than
+  # tracking master. Keep it in step with odin-tensor's CI.
+  ODIN_COMMIT: 90c44058bda022813cc236d0e280fdba91bde12f
+  LLVM_VERSION: 18
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: odin-ann
+    steps:
+      # The sources import "../odin-tensor", so both repositories are checked
+      # out side by side under the workspace.
+      - uses: actions/checkout@v7
+        with:
+          path: odin-ann
+
+      - name: Check out odin-tensor
+        uses: actions/checkout@v7
+        with:
+          repository: wardjm/odin-tensor
+          path: odin-tensor
+          ssh-key: ${{ secrets.ODIN_TENSOR_DEPLOY_KEY }}
+
+      - name: Restore Odin
+        id: odin-cache
+        uses: actions/cache@v6
+        with:
+          path: odin-compiler
+          key: odin-${{ env.ODIN_COMMIT }}-llvm${{ env.LLVM_VERSION }}
+
+      - name: Install LLVM
+        run: |
+          wget -q https://apt.llvm.org/llvm.sh
+          chmod +x llvm.sh
+          sudo ./llvm.sh "$LLVM_VERSION"
+          echo "/usr/lib/llvm-$LLVM_VERSION/bin" >> "$GITHUB_PATH"
+
+      - name: Check out Odin
+        if: steps.odin-cache.outputs.cache-hit != 'true'
+        uses: actions/checkout@v7
+        with:
+          repository: odin-lang/Odin
+          ref: ${{ env.ODIN_COMMIT }}
+          path: odin-compiler
+
+      - name: Build Odin
+        if: steps.odin-cache.outputs.cache-hit != 'true'
+        working-directory: odin-compiler
+        run: ./build_odin.sh release
+
+      - name: Add Odin to PATH
+        run: echo "$GITHUB_WORKSPACE/odin-compiler" >> "$GITHUB_PATH"
+
+      - name: Odin version
+        run: odin version
+
+      - name: Tests
+        run: odin test . -vet -strict-style -define:ODIN_TEST_FAIL_ON_BAD_MEMORY=true
+
+      - name: README examples
+        run: scripts/check_readme.sh
+
+      - name: Examples and benchmark compile
+        run: |
+          for dir in examples/* bench/torch_parity; do
+            echo "::group::$dir"
+            odin check "$dir" -vet -strict-style
+            echo "::endgroup::"
+          done

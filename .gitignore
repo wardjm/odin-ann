@@ -1,0 +1,9 @@
+# Build outputs
+*.bin
+/torch_parity
+/bench/torch_parity/torch_parity
+/examples/*/linear_regression
+/examples/*/sine
+/examples/*/spirals
+/examples/*/xor
+__pycache__/

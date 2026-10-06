@@ -1,0 +1,71 @@
+package ann
+
+import "base:intrinsics"
+import tensor "../odin-tensor"
+
+// forward evaluates input through every layer. input is [..., features]: a
+// single sample, a [batch, features] matrix, or any number of leading batch
+// axes. The result is [..., output_features] and is owned by the caller.
+forward :: proc(network: Network($T), input: tensor.Tensor(T), allocator := context.allocator) -> (tensor.Tensor(T), Error) where intrinsics.type_is_float(T) {
+	return _forward(network, tensor.as_view(input), false, allocator)
+}
+
+// forward_views is forward for a borrowed view, such as a slice of a dataset.
+forward_views :: proc(network: Network($T), input: tensor.Tensor_View(T), allocator := context.allocator) -> (tensor.Tensor(T), Error) where intrinsics.type_is_float(T) {
+	return _forward(network, input, false, allocator)
+}
+
+// _forward runs every layer, skipping the last activation when
+// skip_last_activation is set so fused losses can work from logits. Each layer
+// allocates one tensor; the bias and activation are applied in place.
+_forward :: proc(network: Network($T), input: tensor.Tensor_View(T), skip_last_activation: bool, allocator := context.allocator) -> (output: tensor.Tensor(T), err: Error) where intrinsics.type_is_float(T) {
+	_check_input(network, input.shape) or_return
+	defer if err != nil {
+		tensor.release(&output)
+	}
+	current := input
+	for layer, i in network.layers {
+		product := tensor.matmul_views(current, tensor.as_view(layer.weights), allocator) or_return
+		tensor.release(&output)
+		output = product
+		tensor.add_in_place(&output, layer.bias) or_return
+		if !(skip_last_activation && i == len(network.layers)-1) {
+			activate_in_place(&output, layer.activation, allocator) or_return
+		}
+		current = tensor.as_view(output)
+	}
+	return output, nil
+}
+
+// activate_in_place applies activation to every element of t. Softmax needs
+// two small [..., 1] temporaries from allocator.
+activate_in_place :: proc(t: ^tensor.Tensor($T), activation: Activation, allocator := context.allocator) -> Error where intrinsics.type_is_float(T) {
+	switch activation {
+	case .Identity:
+	case .ReLU:
+		tensor.relu_in_place(t) or_return
+	case .Sigmoid:
+		tensor.sigmoid_in_place(t) or_return
+	case .Tanh:
+		tensor.tanh_in_place(t) or_return
+	case .Softmax:
+		softmax_in_place(t, allocator) or_return
+	}
+	return nil
+}
+
+// softmax_in_place normalizes t over its last axis. Subtracting each row's
+// maximum first keeps exp from overflowing.
+softmax_in_place :: proc(t: ^tensor.Tensor($T), allocator := context.allocator) -> Error where intrinsics.type_is_float(T) {
+	if len(t.shape) == 0 {
+		return .Invalid_Shape
+	}
+	row_max := tensor.max_axis(t^, -1, keep_dims = true, allocator = allocator) or_return
+	defer tensor.release(&row_max)
+	tensor.sub_in_place(t, row_max) or_return
+	tensor.exp_in_place(t) or_return
+	row_sum := tensor.sum_axis(t^, -1, keep_dims = true, allocator = allocator) or_return
+	defer tensor.release(&row_sum)
+	tensor.div_in_place(t, row_sum) or_return
+	return nil
+}

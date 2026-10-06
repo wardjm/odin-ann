@@ -1,0 +1,209 @@
+// The Odin half of the PyTorch comparison. bench/torch_parity.py writes a
+// case directory (spec.txt plus raw little-endian arrays), builds this program
+// with -o:speed, and runs it once per case:
+//
+//     torch_parity <case_dir>
+//
+// The program loads the network and data, writes the forward output, the loss
+// from every training step and the final parameters, then times forward and
+// train_step and writes the medians to timing.txt.
+package torch_parity
+
+import "core:fmt"
+import "core:mem"
+import "core:os"
+import "core:slice"
+import "core:strconv"
+import "core:strings"
+import "core:time"
+import ann "../.."
+import tensor "../../../odin-tensor"
+
+Spec :: struct {
+	dtype:       string,
+	layers:      [dynamic]Layer_Spec,
+	loss:        ann.Loss,
+	optimizer:   ann.Optimizer,
+	batch:       int,
+	features:    int,
+	outputs:     int,
+	steps:       int,
+	fwd_reps:    int,
+	train_reps:  int,
+}
+
+Layer_Spec :: struct {
+	inputs, outputs: int,
+	activation:      ann.Activation,
+}
+
+main :: proc() {
+	if len(os.args) != 2 {
+		fmt.eprintln("usage: torch_parity <case_dir>")
+		os.exit(2)
+	}
+	dir := os.args[1]
+	spec, ok := parse_spec(dir)
+	if !ok {
+		os.exit(2)
+	}
+	err: ann.Error
+	switch spec.dtype {
+	case "f32":
+		err = run(f32, dir, spec)
+	case "f64":
+		err = run(f64, dir, spec)
+	case:
+		fmt.eprintln("unknown dtype", spec.dtype)
+		os.exit(2)
+	}
+	if err != nil {
+		fmt.eprintln("error:", err)
+		os.exit(1)
+	}
+}
+
+run :: proc($T: typeid, dir: string, spec: Spec) -> ann.Error {
+	network := ann.new_network(T)
+	defer ann.release(&network)
+	for layer, i in spec.layers {
+		ann.dense(&network, layer.inputs, layer.outputs, layer.activation) or_return
+		load_into(dir, fmt.tprintf("w%d.bin", i), network.layers[i].weights.data) or_return
+		load_into(dir, fmt.tprintf("b%d.bin", i), network.layers[i].bias.data) or_return
+	}
+
+	inputs := tensor.new_tensor(T, []int{spec.batch, spec.features}) or_return
+	defer tensor.release(&inputs)
+	load_into(dir, "x.bin", inputs.data) or_return
+	targets := tensor.new_tensor(T, []int{spec.batch, spec.outputs}) or_return
+	defer tensor.release(&targets)
+	load_into(dir, "y.bin", targets.data) or_return
+
+	// Correctness: forward output, then the loss of each step and the
+	// parameters after the last one.
+	output := ann.forward(network, inputs) or_return
+	save(dir, "out_forward.bin", output.data)
+	tensor.release(&output)
+
+	trainer := ann.trainer_init(T, spec.loss, spec.optimizer) or_return
+	defer ann.trainer_release(&trainer)
+	losses := make([]f64, spec.steps, context.temp_allocator)
+	for &loss in losses {
+		value := ann.train_step(&trainer, &network, inputs, targets) or_return
+		loss = f64(value)
+	}
+	save(dir, "out_losses.bin", losses)
+	for layer, i in network.layers {
+		save(dir, fmt.tprintf("out_w%d.bin", i), layer.weights.data)
+		save(dir, fmt.tprintf("out_b%d.bin", i), layer.bias.data)
+	}
+
+	// Timing. Training continues on the same network; the values no longer
+	// matter, only the cost of each call.
+	forward_samples := make([]f64, spec.fwd_reps, context.temp_allocator)
+	for &sample in forward_samples {
+		start := time.tick_now()
+		result := ann.forward(network, inputs) or_return
+		tensor.release(&result)
+		sample = time.duration_milliseconds(time.tick_since(start))
+	}
+	train_samples := make([]f64, spec.train_reps, context.temp_allocator)
+	for &sample in train_samples {
+		start := time.tick_now()
+		ann.train_step(&trainer, &network, inputs, targets) or_return
+		sample = time.duration_milliseconds(time.tick_since(start))
+	}
+	timing := fmt.tprintf("forward_ms %.6f\ntrain_step_ms %.6f\n", median(forward_samples), median(train_samples))
+	_ = os.write_entire_file(path(dir, "timing.txt"), timing)
+	return nil
+}
+
+median :: proc(samples: []f64) -> f64 {
+	slice.sort(samples)
+	return samples[len(samples)/2]
+}
+
+path :: proc(dir, name: string) -> string {
+	return strings.concatenate({dir, "/", name}, context.temp_allocator)
+}
+
+load_into :: proc(dir, name: string, destination: []$T) -> ann.Error {
+	bytes, err := os.read_entire_file(path(dir, name), context.temp_allocator)
+	if err != nil || len(bytes) != len(destination)*size_of(T) {
+		fmt.eprintfln("%s: read error %v or %d bytes, wanted %d", name, err, len(bytes), len(destination)*size_of(T))
+		return .Shape_Mismatch
+	}
+	mem.copy(raw_data(destination), raw_data(bytes), len(bytes))
+	return nil
+}
+
+save :: proc(dir, name: string, values: []$T) {
+	if err := os.write_entire_file(path(dir, name), slice.to_bytes(values)); err != nil {
+		fmt.eprintln(name, err)
+	}
+}
+
+// parse_spec reads spec.txt: one "key value..." entry per line.
+parse_spec :: proc(dir: string) -> (spec: Spec, ok: bool) {
+	text, err := os.read_entire_file(path(dir, "spec.txt"), context.temp_allocator)
+	if err != nil {
+		fmt.eprintln("spec.txt:", err)
+		return
+	}
+	for line in strings.split_lines(string(text), context.temp_allocator) {
+		f := strings.fields(line, context.temp_allocator)
+		if len(f) == 0 {
+			continue
+		}
+		switch f[0] {
+		case "dtype":
+			spec.dtype = f[1]
+		case "layer":
+			activation, found := fmt.string_to_enum_value(ann.Activation, f[3])
+			if !found {
+				fmt.eprintln("unknown activation", f[3])
+				return
+			}
+			append(&spec.layers, Layer_Spec{atoi(f[1]), atoi(f[2]), activation})
+		case "loss":
+			loss, found := fmt.string_to_enum_value(ann.Loss, f[1])
+			if !found {
+				fmt.eprintln("unknown loss", f[1])
+				return
+			}
+			spec.loss = loss
+		case "sgd":
+			spec.optimizer = ann.sgd(atof(f[1]), momentum = atof(f[2]), weight_decay = atof(f[3]))
+		case "adam":
+			spec.optimizer = ann.adam(atof(f[1]), atof(f[2]), atof(f[3]), atof(f[4]), atof(f[5]))
+		case "batch":
+			spec.batch = atoi(f[1])
+		case "steps":
+			spec.steps = atoi(f[1])
+		case "fwd_reps":
+			spec.fwd_reps = atoi(f[1])
+		case "train_reps":
+			spec.train_reps = atoi(f[1])
+		case:
+			fmt.eprintln("unknown spec key", f[0])
+			return
+		}
+	}
+	if len(spec.layers) == 0 {
+		fmt.eprintln("spec has no layers")
+		return
+	}
+	spec.features = spec.layers[0].inputs
+	spec.outputs = spec.layers[len(spec.layers)-1].outputs
+	return spec, true
+}
+
+atoi :: proc(s: string) -> int {
+	value, _ := strconv.parse_int(s)
+	return value
+}
+
+atof :: proc(s: string) -> f64 {
+	value, _ := strconv.parse_f64(s)
+	return value
+}
