@@ -1,6 +1,6 @@
 # odin-ann
 
-A small Odin neural-network library built on the sibling [`odin-tensor`](../odin-tensor) package. It covers sequential dense networks, five activations, three losses, SGD with momentum and Adam/AdamW, and a minibatch training loop. Gradients come from the tensor library's reverse-mode autodiff tape.
+A small Odin neural-network library built on the [`odin-tensor`](https://github.com/wardjm/odin-tensor) package. It covers sequential dense networks, five activations, three losses, SGD with momentum and Adam/AdamW, and a minibatch training loop. Gradients come from the tensor library's reverse-mode autodiff tape.
 
 ## Features
 
@@ -11,9 +11,34 @@ A small Odin neural-network library built on the sibling [`odin-tensor`](../odin
 - `train_step` for hand-written loops, and `fit` with shuffled or in-order minibatches, a per-epoch callback, and early stopping.
 - `evaluate`, `accuracy`, `predict_classes` and `one_hot`.
 
+## Installation
+
+odin-ann imports odin-tensor as `../odin-tensor`, so the two repositories must be checked out next to each other, under those directory names:
+
+```sh
+mkdir libs && cd libs
+git clone https://github.com/wardjm/odin-ann.git
+git clone https://github.com/wardjm/odin-tensor.git
+```
+
+Your program must import odin-tensor from that same checkout. odin-ann's API takes and returns `tensor.Tensor` values, so you will need the import. A second copy elsewhere, such as a vendored one, does not work: two packages named `tensor` cannot be in one build, and the compiler stops with `Duplicate declaration of 'package tensor'`.
+
+The simplest way to do this is a collection that points at the directory holding both checkouts:
+
+```sh
+odin run my_app -collection:libs=path/to/libs
+```
+
+```odin
+import ann "libs:odin-ann"
+import tensor "libs:odin-tensor"
+```
+
+Relative imports such as `"../libs/odin-ann"` also work, provided both point into the same `libs` directory.
+
 ## Quick start
 
-The directory names contain hyphens, so both imports need explicit names. Replace the paths with the ones your project uses:
+The directory names contain hyphens, so both imports need explicit names. Replace the paths with the ones your project uses, as described in [Installation](#installation):
 
 ```odin
 package main
