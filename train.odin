@@ -167,6 +167,12 @@ _record_layer :: proc(tape: ^tensor.Tape($T), layer: Layer(T), input: tensor.Tap
 	case .Dense:
 		product := tensor.tape_matmul(tape, input, parameters[0]) or_return
 		output = tensor.tape_add(tape, product, parameters[1]) or_return
+	case .Conv2D:
+		output = _record_conv2d(tape, layer, input, parameters[0], parameters[1]) or_return
+	case .Max_Pool2D:
+		output = _record_max_pool2d(tape, layer, input) or_return
+	case .Flatten:
+		output = _record_flatten(tape, layer, input) or_return
 	}
 	return output, nil
 }

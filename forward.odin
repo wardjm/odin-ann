@@ -36,7 +36,8 @@ _forward :: proc(network: Network($T), input: tensor.Tensor_View(T), skip_last_a
 }
 
 // _layer_forward computes one layer before its activation, as a new tensor.
-// A dense layer allocates one tensor and adds its bias in place.
+// A dense layer allocates one tensor and adds its bias in place. input's
+// trailing axes are the layer's input sample shape.
 _layer_forward :: proc(layer: Layer($T), input: tensor.Tensor_View(T), allocator := context.allocator) -> (output: tensor.Tensor(T), err: Error) where intrinsics.type_is_float(T) {
 	switch layer.kind {
 	case .Dense:
@@ -45,6 +46,12 @@ _layer_forward :: proc(layer: Layer($T), input: tensor.Tensor_View(T), allocator
 			tensor.release(&output)
 			return output, add_err
 		}
+	case .Conv2D:
+		return _conv2d_forward(layer, input, allocator)
+	case .Max_Pool2D:
+		return _max_pool2d_forward(layer, input, allocator)
+	case .Flatten:
+		return _flatten_forward(layer, input, allocator)
 	}
 	return output, nil
 }

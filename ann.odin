@@ -43,9 +43,16 @@ Activation :: enum {
 	Softmax,
 }
 
-// Layer_Kind is what a layer computes. Only Dense exists so far.
+// Layer_Kind is what a layer computes.
 Layer_Kind :: enum {
+	// Fully connected: [features] -> [outputs].
 	Dense,
+	// Valid, stride-1 convolution over [height, width, channels] samples.
+	Conv2D,
+	// Non-overlapping max pooling over [height, width, channels] samples.
+	Max_Pool2D,
+	// Collapses a sample into one vector, so a Dense layer can follow.
+	Flatten,
 }
 
 // MAX_SAMPLE_RANK bounds the rank of one sample's shape, such as [features]
@@ -60,11 +67,15 @@ Sample_Shape :: struct {
 
 Layer :: struct($T: typeid) {
 	kind:         Layer_Kind,
-	// weights and bias are empty for a kind without parameters.
-	weights:      tensor.Tensor(T), // Dense: [input_features, output_features]
-	bias:         tensor.Tensor(T), // Dense: [output_features]
+	// weights and bias are empty for Max_Pool2D and Flatten.
+	weights:      tensor.Tensor(T), // Dense: [input_features, output_features]; Conv2D: [kernel, kernel, input_channels, output_channels]
+	bias:         tensor.Tensor(T), // Dense: [output_features]; Conv2D: [output_channels]
 	activation:   Activation,
-	// output_shape is one sample's shape after this layer.
+	// pool_size is a Max_Pool2D window's side, which is also its stride.
+	pool_size:    int,
+	// input_shape and output_shape are one sample's shape before and after
+	// this layer.
+	input_shape:  Sample_Shape,
 	output_shape: Sample_Shape,
 }
 
@@ -72,8 +83,8 @@ Layer :: struct($T: typeid) {
 // Network values as move-only and call release once when finished.
 Network :: struct($T: typeid) {
 	layers:      [dynamic]Layer(T),
-	// input_shape is one sample's shape before the first layer, set when the
-	// first layer is added.
+	// input_shape is one sample's shape before the first layer, set by
+	// set_input_shape or by a first Dense layer. Its rank is zero until then.
 	input_shape: Sample_Shape,
 	// rng draws initial weights, so the same seed and layer sequence always
 	// build the same network.
@@ -97,9 +108,32 @@ release :: proc(network: ^Network($T)) {
 	network^ = {}
 }
 
+// set_input_shape fixes the shape of one input sample, such as
+// []int{28, 28, 1} for a grayscale image. Conv2D, Max_Pool2D and Flatten need
+// it when they come first; a first Dense layer sets it itself. It must be
+// called before any layer is added, or with the shape the network already
+// has; otherwise it returns Shape_Mismatch.
+set_input_shape :: proc(network: ^Network($T), shape: []int) -> Error {
+	if len(shape) == 0 || len(shape) > MAX_SAMPLE_RANK {
+		return .Invalid_Shape
+	}
+	for dim in shape {
+		if dim <= 0 {
+			return .Invalid_Shape
+		}
+	}
+	requested := _sample_shape(..shape)
+	if network.input_shape.rank > 0 && !_same_sample_shape(network.input_shape, requested) {
+		return .Shape_Mismatch
+	}
+	network.input_shape = requested
+	return nil
+}
+
 // dense appends a fully connected layer. Its input must be a vector of
-// input_features: either it is the first layer, or the preceding layer's
-// output is [input_features]. Weights are drawn uniformly with He scaling for
+// input_features: [input_features] is the network's input shape or the
+// preceding layer's output, or the network has no input shape yet and this
+// sets it. Weights are drawn uniformly with He scaling for
 // ReLU and Glorot scaling otherwise; biases start at zero. The parameters are
 // ordinary tensors, so callers may overwrite them.
 dense :: proc(network: ^Network($T), input_features, output_features: int, activation := Activation.Identity) -> Error where intrinsics.type_is_float(T) {
@@ -107,7 +141,7 @@ dense :: proc(network: ^Network($T), input_features, output_features: int, activ
 		return .Invalid_Shape
 	}
 	input_shape := _sample_shape(input_features)
-	if len(network.layers) > 0 && !_same_sample_shape(_output_shape(network^), input_shape) {
+	if current := _current_shape(network^); current.rank > 0 && !_same_sample_shape(current, input_shape) {
 		return .Shape_Mismatch
 	}
 
@@ -118,14 +152,20 @@ dense :: proc(network: ^Network($T), input_features, output_features: int, activ
 		return err
 	}
 
-	fan := f64(input_features + output_features) / 2
-	if activation == .ReLU {
-		fan = f64(input_features) / 2
-	}
-	_fill_uniform(network, &weights, math.sqrt(3 / fan))
+	_fill_uniform(network, &weights, _init_limit(input_features, output_features, activation))
 
-	layer := Layer(T){kind = .Dense, weights = weights, bias = bias, activation = activation, output_shape = _sample_shape(output_features)}
-	return _append_layer(network, layer, input_shape)
+	layer := Layer(T){kind = .Dense, weights = weights, bias = bias, activation = activation, input_shape = input_shape, output_shape = _sample_shape(output_features)}
+	return _append_layer(network, layer)
+}
+
+// _init_limit bounds uniform initial weights: He scaling, sqrt(6/fan_in), for
+// ReLU and Glorot scaling, sqrt(6/(fan_in+fan_out)), otherwise.
+_init_limit :: proc(fan_in, fan_out: int, activation: Activation) -> f64 {
+	fan := f64(fan_in + fan_out) / 2
+	if activation == .ReLU {
+		fan = f64(fan_in) / 2
+	}
+	return math.sqrt(3 / fan)
 }
 
 // _fill_uniform draws every element of t from [-limit, limit] with the
@@ -138,17 +178,17 @@ _fill_uniform :: proc(network: ^Network($T), t: ^tensor.Tensor(T), limit: f64) {
 }
 
 // _append_layer takes ownership of layer's parameters, releasing them if the
-// append fails. input_shape becomes the network's input shape when layer is
-// the first.
-_append_layer :: proc(network: ^Network($T), layer: Layer(T), input_shape: Sample_Shape) -> Error {
+// append fails. layer.input_shape becomes the network's input shape if it has
+// none yet.
+_append_layer :: proc(network: ^Network($T), layer: Layer(T)) -> Error {
 	layer := layer
 	if _, alloc_err := append(&network.layers, layer); alloc_err != nil {
 		tensor.release(&layer.weights)
 		tensor.release(&layer.bias)
 		return .Allocation_Failed
 	}
-	if len(network.layers) == 1 {
-		network.input_shape = input_shape
+	if network.input_shape.rank == 0 {
+		network.input_shape = layer.input_shape
 	}
 	return nil
 }
@@ -157,9 +197,10 @@ _append_layer :: proc(network: ^Network($T), layer: Layer(T), input_shape: Sampl
 // records and updates them, using buffer for storage.
 _layer_parameters :: proc(layer: ^Layer($T), buffer: ^[2]^tensor.Tensor(T)) -> []^tensor.Tensor(T) {
 	switch layer.kind {
-	case .Dense:
+	case .Dense, .Conv2D:
 		buffer^ = {&layer.weights, &layer.bias}
 		return buffer[:]
+	case .Max_Pool2D, .Flatten:
 	}
 	return nil
 }
@@ -189,12 +230,13 @@ _same_sample_shape :: proc(a, b: Sample_Shape) -> bool {
 	return _same_shape(_sample_dims(&a), _sample_dims(&b))
 }
 
-// _layer_input_shape is one sample's shape as layer index receives it.
-_layer_input_shape :: proc(network: Network($T), index: int) -> Sample_Shape {
-	if index == 0 {
+// _current_shape is the sample shape the next layer would receive: the last
+// layer's output, or the network's input shape, whose rank is zero if unset.
+_current_shape :: proc(network: Network($T)) -> Sample_Shape {
+	if len(network.layers) == 0 {
 		return network.input_shape
 	}
-	return network.layers[index-1].output_shape
+	return _output_shape(network)
 }
 
 // _output_shape is one sample's shape after the last layer. The network must
@@ -235,7 +277,7 @@ parameter_count :: proc(network: Network($T)) -> int {
 print_summary :: proc(network: Network($T)) {
 	_print_summary_header()
 	for layer, i in network.layers {
-		_print_summary_row(i, layer.kind, _layer_input_shape(network, i), layer.output_shape, layer.activation, len(layer.weights.data)+len(layer.bias.data))
+		_print_summary_row(i, layer.kind, layer.input_shape, layer.output_shape, layer.activation, len(layer.weights.data)+len(layer.bias.data))
 	}
 	_print_summary_total(parameter_count(network))
 }
@@ -243,13 +285,13 @@ print_summary :: proc(network: Network($T)) {
 // The printing helpers are not generic, so core:fmt counts as used even when
 // a program never instantiates print_summary.
 _print_summary_header :: proc() {
-	fmt.printf("%-6s %-8s %-22s %-10s %s\n", "layer", "kind", "shape", "activation", "parameters")
+	fmt.printf("%-6s %-10s %-22s %-10s %s\n", "layer", "kind", "shape", "activation", "parameters")
 }
 
 _print_summary_row :: proc(index: int, kind: Layer_Kind, input, output: Sample_Shape, activation: Activation, parameters: int) {
 	input, output := input, output
 	shape := fmt.tprintf("%s -> %s", _format_shape(_sample_dims(&input)), _format_shape(_sample_dims(&output)))
-	fmt.printf("%-6d %-8v %-22s %-10v %d\n", index, kind, shape, activation, parameters)
+	fmt.printf("%-6d %-10v %-22s %-10v %d\n", index, kind, shape, activation, parameters)
 }
 
 _print_summary_total :: proc(parameters: int) {

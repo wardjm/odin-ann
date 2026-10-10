@@ -5,6 +5,7 @@ A small Odin neural-network library built on the [`odin-tensor`](https://github.
 ## Features
 
 - Dense layers with Identity, ReLU, Sigmoid, Tanh and Softmax activations, generic over `f32` or `f64`. Weights are drawn from a seeded generator, with He scaling for ReLU and Glorot otherwise.
+- Image layers on channels-last `[height, width, channels]` samples: valid, stride-1 `conv2d`, non-overlapping `max_pool2d`, and `flatten` to feed a dense layer.
 - `forward` takes a single sample `[features]`, a batch `[batch, features]`, or any number of leading batch axes. A `[2, 5, features]` input gives `[2, 5, outputs]`.
 - Mean-squared error, binary cross-entropy and categorical cross-entropy. The cross-entropy losses work from the final layer's logits, so they stay finite when outputs saturate.
 - `SGD` (optional momentum) and `Adam` (bias-corrected; a nonzero `weight_decay` makes it AdamW), with learning-rate changes between steps.
@@ -97,9 +98,13 @@ Every fallible procedure returns `ann.Error`, a `#shared_nil` union of `tensor.T
 ### Networks
 
 - `new_network(T, seed = 0, allocator)` creates an empty `Network(T)` for a float type `T`. `release(&network)` frees it. Treat networks as move-only.
-- `dense(&network, inputs, outputs, activation = .Identity)` appends a layer and returns `.Shape_Mismatch` unless the previous layer's output is `[inputs]`. Each `Layer(T)` holds its `kind` (`.Dense`), `weights` `[inputs, outputs]`, `bias` `[outputs]`, `activation`, and `output_shape`, the shape of one sample after the layer. The network's `input_shape` is set by its first layer. The parameters are ordinary tensors, so you can set or load them directly.
+- `set_input_shape(&network, shape)` fixes the shape of one input sample, such as `[]int{28, 28, 1}`. A network that starts with an image layer needs it; a first `dense` layer sets `[inputs]` itself. Calling it after layers are added returns `.Shape_Mismatch` unless the shape is unchanged.
+- `dense(&network, inputs, outputs, activation = .Identity)` appends a fully connected layer and returns `.Shape_Mismatch` unless its input is `[inputs]`.
+- `conv2d(&network, input_channels, output_channels, kernel_size, activation = .Identity)` appends a valid, stride-1 convolution with square kernels. `[h, w, input_channels]` becomes `[h-kernel_size+1, w-kernel_size+1, output_channels]`; weights are `[kernel_size, kernel_size, input_channels, output_channels]` and biases `[output_channels]`.
+- `max_pool2d(&network, pool_size = 2)` takes the maximum of each non-overlapping `pool_size` × `pool_size` window, so `[h, w, c]` becomes `[h/pool_size, w/pool_size, c]`, rounding down. `flatten(&network)` turns each sample into one vector in row-major order. Neither has parameters.
+- Each `Layer(T)` holds its `kind`, `weights`, `bias`, `activation`, `pool_size`, and the `input_shape` and `output_shape` of one sample. The parameters are ordinary tensors, so you can set or load them directly.
 - `input_features_of` and `output_features_of` give the last axis of one input or output sample. `parameter_count` and `print_summary` describe a network.
-- `forward(network, input, allocator)` and `forward_views` return a new tensor owned by the caller. The input's trailing axes must match the network's `input_shape`; any leading axes are batch axes. Each dense layer allocates one tensor and applies its bias and activation in place.
+- `forward(network, input, allocator)` and `forward_views` return a new tensor owned by the caller. The input's trailing axes must match the network's `input_shape`; any leading axes are batch axes, so a batch of MNIST images is `[batch, 28, 28, 1]`. Each dense layer allocates one tensor and applies its bias and activation in place.
 - `activate_in_place` and `softmax_in_place` apply an activation to any tensor. Softmax normalizes over the last axis and subtracts the row maximum first.
 
 ### Losses
@@ -133,7 +138,9 @@ loss, step_err := ann.train_step(&trainer, &network, inputs, targets)
 
 ## How training uses the tape
 
-Each step records the network on the trainer's tape. The input enters as a constant leaf (`tape_add_leaf_view`, no gradient). Every weight and bias enters as a borrowed leaf, and each layer becomes `tape_matmul` → `tape_add` → activation. Matmul and add broadcast, so leading batch axes need no special handling.
+Each step records the network on the trainer's tape. The input enters as a constant leaf (`tape_add_leaf_view`, no gradient). Every weight and bias enters as a borrowed leaf, and each dense layer becomes `tape_matmul` → `tape_add` → activation. Matmul and add broadcast, so leading batch axes need no special handling.
+
+A convolution is a sum over kernel offsets. For each `(dy, dx)`, two `tape_slice`s give the strided input window, and `tape_matmul` multiplies it by that offset's `[input_channels, output_channels]` slice of the weights; `tape_add` sums the products and adds the bias. `forward` computes the same terms in the same order, so it agrees with training exactly. Max pooling reshapes each sample into `[h/p, p, w/p, p, c]` blocks and takes `tape_max_axis` twice, and `flatten` is a `tape_reshape`. Each convolution records about three nodes per kernel offset, so training a convolutional network is much slower than its forward pass.
 
 The loss itself is never recorded. Its value and its gradient with respect to the network output are computed directly with tensor kernels. That gradient seeds `tape_backward_with_seed` at the output, or at the final logits for the cross-entropy losses. The fused gradients are `sigmoid(z) - y` and `softmax(z) * sum(y) - y`, computed exactly, without differentiating through `log(sigmoid)`.
 
@@ -145,7 +152,7 @@ A Softmax in a hidden layer, or before mean-squared error, is recorded as `exp(x
 odin test . -vet -strict-style -define:ODIN_TEST_FAIL_ON_BAD_MEMORY=true
 ```
 
-The tests compare every loss's gradients, including a fused 3-D batch and a hidden softmax, against central finite differences in `f64`. They check that `fit` with in-order batches matches hand-sliced `train_step` calls bit for bit. A failing allocator drives every `.Allocation_Failed` path through building, training, evaluating and measuring a network, and the define makes any leak a failure.
+The tests compare every loss's gradients, including a fused 3-D batch, a hidden softmax and a network using every image layer, against central finite differences in `f64`. Convolution and pooling are also checked against direct loops. They check that `fit` with in-order batches matches hand-sliced `train_step` calls bit for bit. A failing allocator drives every `.Allocation_Failed` path through building, training, evaluating and measuring a network, and the define makes any leak a failure.
 
 ```sh
 scripts/check_readme.sh
