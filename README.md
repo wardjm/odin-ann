@@ -88,7 +88,7 @@ Run these from the repository root:
 | `odin run examples/xor` | Binary cross-entropy, Adam, `print_summary`, and early stopping from the `on_epoch` callback. |
 | `odin run examples/sine -o:speed` | Regression with shuffled minibatches and a learning-rate schedule set from the callback, plotted as text. |
 | `odin run examples/spirals -o:speed` | Three-class softmax cross-entropy, `one_hot`, `accuracy`, and a decision map from one batched `predict_classes` call. |
-| `odin run examples/mnist -o:speed` | A convolutional network (`conv2d`, `max_pool2d`, `flatten`) on the MNIST digits, with test accuracy from `on_epoch` after each epoch. Run `scripts/fetch_mnist.sh` first to download the data, about 11 MB, into `data/mnist`. Three epochs take about 2.5 minutes on one core and reach about 98.6% test accuracy. |
+| `odin run examples/mnist -o:speed` | A convolutional network (`conv2d`, `max_pool2d`, `flatten`) on the MNIST digits, with test accuracy from `on_epoch` after each epoch. Run `scripts/fetch_mnist.sh` first to download the data, about 11 MB, into `data/mnist`. Three epochs take about a minute on one core and reach about 98.6% test accuracy. |
 
 ## API
 
@@ -141,7 +141,7 @@ loss, step_err := ann.train_step(&trainer, &network, inputs, targets)
 
 Each step records the network on the trainer's tape. The input enters as a constant leaf (`tape_add_leaf_view`, no gradient). Every weight and bias enters as a borrowed leaf, and each dense layer becomes `tape_matmul` → `tape_add` → activation. Matmul and add broadcast, so leading batch axes need no special handling.
 
-A convolution is `tape_im2col`, which gathers each output position's input window into one row, then a single `tape_matmul` of those rows by the weights viewed as `[kernel_size²·input_channels, output_channels]`, and a bias `tape_add`. `forward` computes the same product the same way, so it agrees with training exactly. Max pooling reshapes each sample into `[h/p, p, w/p, p, c]` blocks and takes `tape_max_axis` twice, and `flatten` is a `tape_reshape`.
+A convolution is `tape_im2col`, which gathers each output position's input window into one row, then a single `tape_matmul` of those rows by the weights viewed as `[kernel_size²·input_channels, output_channels]`, and a bias `tape_add`. `forward` computes the same product the same way, so it agrees with training exactly. Max pooling is `tape_max_pool2d`, and `flatten` is a `tape_reshape`.
 
 The loss itself is never recorded. Its value and its gradient with respect to the network output are computed directly with tensor kernels. That gradient seeds `tape_backward_with_seed` at the output, or at the final logits for the cross-entropy losses. The fused gradients are `sigmoid(z) - y` and `softmax(z) * sum(y) - y`, computed exactly, without differentiating through `log(sigmoid)`.
 

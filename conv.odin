@@ -126,49 +126,12 @@ _record_conv2d :: proc(tape: ^tensor.Tape($T), layer: Layer(T), input, weights, 
 	return tensor.tape_reshape(tape, output, output_shape)
 }
 
-// _pool_blocks_shape writes the shape that splits [..., height, width, c] into
-// [..., out_h, pool, out_w, pool, c] blocks into buffer. Taking the max over
-// the axes at height_axis+3 and then height_axis+1 pools each window.
-_pool_blocks_shape :: proc(layer: Layer($T), leading: []int, buffer: []int) -> []int {
-	copy(buffer, leading)
-	pool := layer.pool_size
-	blocks := [5]int{layer.output_shape.dims[0], pool, layer.output_shape.dims[1], pool, layer.output_shape.dims[2]}
-	copy(buffer[len(leading):], blocks[:])
-	return buffer[:len(leading)+5]
-}
-
-// _max_pool2d_forward copies the pooled region of input into contiguous
-// blocks and takes the maximum of each window.
 _max_pool2d_forward :: proc(layer: Layer($T), input: tensor.Tensor_View(T), allocator := context.allocator) -> (output: tensor.Tensor(T), err: Error) where intrinsics.type_is_float(T) {
-	height_axis := len(input.shape) - 3
-	pool := layer.pool_size
-	rows_shape, rows_strides, region_shape, region_strides: [tensor.MAX_RANK]int
-	rows := tensor.slice_view(input, height_axis, 0, layer.output_shape.dims[0]*pool, 1, rows_shape[:], rows_strides[:]) or_return
-	region := tensor.slice_view(rows, height_axis+1, 0, layer.output_shape.dims[1]*pool, 1, region_shape[:], region_strides[:]) or_return
-	blocks := tensor.copy_view(region, allocator) or_return
-	defer tensor.release(&blocks)
-	shape_buffer: [tensor.MAX_RANK]int
-	tensor.reshape(&blocks, _pool_blocks_shape(layer, input.shape[:height_axis], shape_buffer[:])) or_return
-	columns := tensor.max_axis(blocks, height_axis+3, allocator = allocator) or_return
-	defer tensor.release(&columns)
-	return tensor.max_axis(columns, height_axis+1, allocator = allocator)
+	return tensor.max_pool2d_views(input, layer.pool_size, layer.pool_size, allocator)
 }
 
 _record_max_pool2d :: proc(tape: ^tensor.Tape($T), layer: Layer(T), input: tensor.Tape_Value(T)) -> (output: tensor.Tape_Value(T), err: Error) where intrinsics.type_is_float(T) {
-	value := tensor.tape_value(tape, input) or_return
-	height_axis := len(value.shape) - 3
-	pool := layer.pool_size
-	region := input
-	if rows := layer.output_shape.dims[0] * pool; rows != value.shape[height_axis] {
-		region = tensor.tape_slice(tape, region, height_axis, 0, rows) or_return
-	}
-	if columns := layer.output_shape.dims[1] * pool; columns != value.shape[height_axis+1] {
-		region = tensor.tape_slice(tape, region, height_axis+1, 0, columns) or_return
-	}
-	shape_buffer: [tensor.MAX_RANK]int
-	blocks := tensor.tape_reshape(tape, region, _pool_blocks_shape(layer, value.shape[:height_axis], shape_buffer[:])) or_return
-	columns := tensor.tape_max_axis(tape, blocks, height_axis+3) or_return
-	return tensor.tape_max_axis(tape, columns, height_axis+1)
+	return tensor.tape_max_pool2d(tape, input, layer.pool_size, layer.pool_size)
 }
 
 // _flatten_shape writes input's batch axes followed by the layer's flattened
