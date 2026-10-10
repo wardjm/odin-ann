@@ -91,6 +91,7 @@ Run these from the repository root:
 | `odin run examples/sine -o:speed` | Regression with shuffled minibatches and a learning-rate schedule set from the callback, plotted as text. |
 | `odin run examples/spirals -o:speed` | Three-class softmax cross-entropy, `one_hot`, `accuracy`, and a decision map from one batched `predict_classes` call. |
 | `odin run examples/mnist -o:speed` | A convolutional network (`conv2d`, `max_pool2d`, `flatten`) on the MNIST digits, with test accuracy from `on_epoch` after each epoch. It saves the trained network to `data/mnist/cnn.bin`, and `-- data/mnist 0` loads that file and tests it instead of training. Run `scripts/fetch_mnist.sh` first to download the data, about 11 MB, into `data/mnist`. Three epochs reach about 98.6% test accuracy, in about 20 seconds on 8 cores or 40 on one. It uses every physical core unless a third argument, after the data directory and epoch count, sets the thread count. |
+| `odin run examples/mnist_deep -o:speed` | A deeper CNN on MNIST: four 3×3 convolutions, each followed by `batch_norm` with ReLU, and `dropout` before the classifier. The learning rate halves after each epoch through `set_learning_rate` in `on_epoch`. Three epochs reach about 99.2% test accuracy, in about 3 minutes on 8 cores or 5 on one. It takes the same arguments as `examples/mnist`, which shares its MNIST loading through `examples/mnist/digits`. |
 
 ## API
 

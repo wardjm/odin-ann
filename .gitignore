@@ -7,6 +7,7 @@
 /examples/*/spirals
 /examples/*/xor
 /examples/*/mnist
+/examples/*/mnist_deep
 
 # Downloaded datasets (scripts/fetch_mnist.sh)
 /data/
