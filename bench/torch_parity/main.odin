@@ -4,6 +4,12 @@
 //
 //     torch_parity <case_dir>
 //
+// spec.txt describes the network as builder calls: an optional "input h w c"
+// line, then "dense in out activation", "conv2d in_channels out_channels
+// kernel activation", "max_pool2d size" and "flatten" lines in order. Weights
+// and biases are read and written as w<i>.bin and b<i>.bin, where i is the
+// layer's index; layers without parameters have none.
+//
 // The program loads the network and data, writes the forward output, the loss
 // from every training step and the final parameters, then times forward and
 // train_step and writes the medians to timing.txt.
@@ -21,20 +27,24 @@ import tensor "../../../odin-tensor"
 
 Spec :: struct {
 	dtype:       string,
+	// input_shape is one sample's shape; the first layer's input if empty.
+	input_shape: [dynamic]int,
 	layers:      [dynamic]Layer_Spec,
 	loss:        ann.Loss,
 	optimizer:   ann.Optimizer,
 	batch:       int,
-	features:    int,
-	outputs:     int,
 	steps:       int,
 	fwd_reps:    int,
 	train_reps:  int,
 }
 
+// Layer_Spec holds one builder call. sizes are dense's inputs and outputs,
+// conv2d's input channels, output channels and kernel size, or max_pool2d's
+// pool size.
 Layer_Spec :: struct {
-	inputs, outputs: int,
-	activation:      ann.Activation,
+	kind:       ann.Layer_Kind,
+	sizes:      [3]int,
+	activation: ann.Activation,
 }
 
 main :: proc() {
@@ -66,16 +76,34 @@ main :: proc() {
 run :: proc($T: typeid, dir: string, spec: Spec) -> ann.Error {
 	network := ann.new_network(T)
 	defer ann.release(&network)
+	if len(spec.input_shape) > 0 {
+		ann.set_input_shape(&network, spec.input_shape[:]) or_return
+	}
 	for layer, i in spec.layers {
-		ann.dense(&network, layer.inputs, layer.outputs, layer.activation) or_return
-		load_into(dir, fmt.tprintf("w%d.bin", i), network.layers[i].weights.data) or_return
-		load_into(dir, fmt.tprintf("b%d.bin", i), network.layers[i].bias.data) or_return
+		switch layer.kind {
+		case .Dense:
+			ann.dense(&network, layer.sizes[0], layer.sizes[1], layer.activation) or_return
+		case .Conv2D:
+			ann.conv2d(&network, layer.sizes[0], layer.sizes[1], layer.sizes[2], layer.activation) or_return
+		case .Max_Pool2D:
+			ann.max_pool2d(&network, layer.sizes[0]) or_return
+		case .Flatten:
+			ann.flatten(&network) or_return
+		}
+		if layer.kind == .Dense || layer.kind == .Conv2D {
+			load_into(dir, fmt.tprintf("w%d.bin", i), network.layers[i].weights.data) or_return
+			load_into(dir, fmt.tprintf("b%d.bin", i), network.layers[i].bias.data) or_return
+		}
 	}
 
-	inputs := tensor.new_tensor(T, []int{spec.batch, spec.features}) or_return
+	input_shape := make([dynamic]int, context.temp_allocator)
+	append(&input_shape, spec.batch)
+	sample := network.input_shape
+	append(&input_shape, ..sample.dims[:sample.rank])
+	inputs := tensor.new_tensor(T, input_shape[:]) or_return
 	defer tensor.release(&inputs)
 	load_into(dir, "x.bin", inputs.data) or_return
-	targets := tensor.new_tensor(T, []int{spec.batch, spec.outputs}) or_return
+	targets := tensor.new_tensor(T, []int{spec.batch, ann.output_features_of(network)}) or_return
 	defer tensor.release(&targets)
 	load_into(dir, "y.bin", targets.data) or_return
 
@@ -94,8 +122,10 @@ run :: proc($T: typeid, dir: string, spec: Spec) -> ann.Error {
 	}
 	save(dir, "out_losses.bin", losses)
 	for layer, i in network.layers {
-		save(dir, fmt.tprintf("out_w%d.bin", i), layer.weights.data)
-		save(dir, fmt.tprintf("out_b%d.bin", i), layer.bias.data)
+		if layer.kind == .Dense || layer.kind == .Conv2D {
+			save(dir, fmt.tprintf("out_w%d.bin", i), layer.weights.data)
+			save(dir, fmt.tprintf("out_b%d.bin", i), layer.bias.data)
+		}
 	}
 
 	// Timing. Training continues on the same network; the values no longer
@@ -158,13 +188,27 @@ parse_spec :: proc(dir: string) -> (spec: Spec, ok: bool) {
 		switch f[0] {
 		case "dtype":
 			spec.dtype = f[1]
-		case "layer":
-			activation, found := fmt.string_to_enum_value(ann.Activation, f[3])
+		case "input":
+			for field in f[1:] {
+				append(&spec.input_shape, atoi(field))
+			}
+		case "dense", "conv2d":
+			// The activation follows the sizes.
+			layer := Layer_Spec{kind = .Dense if f[0] == "dense" else .Conv2D}
+			for field, i in f[1:len(f)-1] {
+				layer.sizes[i] = atoi(field)
+			}
+			activation, found := fmt.string_to_enum_value(ann.Activation, f[len(f)-1])
 			if !found {
-				fmt.eprintln("unknown activation", f[3])
+				fmt.eprintln("unknown activation", f[len(f)-1])
 				return
 			}
-			append(&spec.layers, Layer_Spec{atoi(f[1]), atoi(f[2]), activation})
+			layer.activation = activation
+			append(&spec.layers, layer)
+		case "max_pool2d":
+			append(&spec.layers, Layer_Spec{kind = .Max_Pool2D, sizes = {atoi(f[1]), 0, 0}})
+		case "flatten":
+			append(&spec.layers, Layer_Spec{kind = .Flatten})
 		case "loss":
 			loss, found := fmt.string_to_enum_value(ann.Loss, f[1])
 			if !found {
@@ -193,8 +237,6 @@ parse_spec :: proc(dir: string) -> (spec: Spec, ok: bool) {
 		fmt.eprintln("spec has no layers")
 		return
 	}
-	spec.features = spec.layers[0].inputs
-	spec.outputs = spec.layers[len(spec.layers)-1].outputs
 	return spec, true
 }
 
