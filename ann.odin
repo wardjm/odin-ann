@@ -24,6 +24,14 @@ Ann_Error :: enum {
 	// The network's parameter shapes no longer match the optimizer state the
 	// trainer built on its first step.
 	Network_Changed,
+	// load or unmarshal was given data that is not a saved network, or is
+	// truncated or inconsistent.
+	Invalid_File,
+	// The saved network uses a newer file format than this library reads.
+	Unsupported_Version,
+	// save or load could not write or read the file.
+	Write_Failed,
+	Read_Failed,
 }
 
 // Error is nil on success. Shape, bounds and allocation failures come from
@@ -34,7 +42,8 @@ Error :: union #shared_nil {
 }
 
 // Activation is applied after a dense layer's affine transform. Softmax
-// normalizes over the last axis.
+// normalizes over the last axis. Saved networks store these by value, so add
+// new members at the end.
 Activation :: enum {
 	Identity,
 	ReLU,
@@ -43,7 +52,8 @@ Activation :: enum {
 	Softmax,
 }
 
-// Layer_Kind is what a layer computes.
+// Layer_Kind is what a layer computes. Saved networks store these by value,
+// so add new members at the end.
 Layer_Kind :: enum {
 	// Fully connected: [features] -> [outputs].
 	Dense,

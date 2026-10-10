@@ -1,6 +1,6 @@
 # odin-ann
 
-A small Odin neural-network library built on the [`odin-tensor`](https://github.com/wardjm/odin-tensor) package. It covers sequential dense networks, five activations, three losses, SGD with momentum and Adam/AdamW, and a minibatch training loop. Gradients come from the tensor library's reverse-mode autodiff tape.
+A small Odin neural-network library built on the [`odin-tensor`](https://github.com/wardjm/odin-tensor) package. It covers sequential dense networks, five activations, three losses, SGD with momentum and Adam/AdamW, a minibatch training loop, and saving networks to files. Gradients come from the tensor library's reverse-mode autodiff tape.
 
 ## Features
 
@@ -11,6 +11,7 @@ A small Odin neural-network library built on the [`odin-tensor`](https://github.
 - `SGD` (optional momentum) and `Adam` (bias-corrected; a nonzero `weight_decay` makes it AdamW), with learning-rate changes between steps.
 - `train_step` for hand-written loops, and `fit` with shuffled or in-order minibatches, a per-epoch callback, and early stopping.
 - `evaluate`, `accuracy`, `predict_classes` and `one_hot`.
+- `save` and `load` store a network's layers and parameters in one compact binary file, so a trained network can be reloaded without the code that built it.
 
 ## Installation
 
@@ -88,13 +89,13 @@ Run these from the repository root:
 | `odin run examples/xor` | Binary cross-entropy, Adam, `print_summary`, and early stopping from the `on_epoch` callback. |
 | `odin run examples/sine -o:speed` | Regression with shuffled minibatches and a learning-rate schedule set from the callback, plotted as text. |
 | `odin run examples/spirals -o:speed` | Three-class softmax cross-entropy, `one_hot`, `accuracy`, and a decision map from one batched `predict_classes` call. |
-| `odin run examples/mnist -o:speed` | A convolutional network (`conv2d`, `max_pool2d`, `flatten`) on the MNIST digits, with test accuracy from `on_epoch` after each epoch. Run `scripts/fetch_mnist.sh` first to download the data, about 11 MB, into `data/mnist`. Three epochs reach about 98.6% test accuracy, in about 20 seconds on 8 cores or 40 on one. It uses every physical core unless a third argument, after the data directory and epoch count, sets the thread count. |
+| `odin run examples/mnist -o:speed` | A convolutional network (`conv2d`, `max_pool2d`, `flatten`) on the MNIST digits, with test accuracy from `on_epoch` after each epoch. It saves the trained network to `data/mnist/cnn.bin`, and `-- data/mnist 0` loads that file and tests it instead of training. Run `scripts/fetch_mnist.sh` first to download the data, about 11 MB, into `data/mnist`. Three epochs reach about 98.6% test accuracy, in about 20 seconds on 8 cores or 40 on one. It uses every physical core unless a third argument, after the data directory and epoch count, sets the thread count. |
 
 ## API
 
 ### Errors
 
-Every fallible procedure returns `ann.Error`, a `#shared_nil` union of `tensor.Tensor_Error` and `ann.Ann_Error`, so `err != nil` checks both and `or_return` passes either along. Shape, bounds and allocation failures come from the tensor library (`.Shape_Mismatch`, `.Allocation_Failed`, ...). `Ann_Error` adds `.Empty_Network`, `.Invalid_Hyperparameter`, `.Loss_Activation_Mismatch`, and `.Network_Changed`, which a trainer returns when the network's layers no longer match its optimizer state.
+Every fallible procedure returns `ann.Error`, a `#shared_nil` union of `tensor.Tensor_Error` and `ann.Ann_Error`, so `err != nil` checks both and `or_return` passes either along. Shape, bounds and allocation failures come from the tensor library (`.Shape_Mismatch`, `.Allocation_Failed`, ...). `Ann_Error` adds `.Empty_Network`, `.Invalid_Hyperparameter`, `.Loss_Activation_Mismatch`, and `.Network_Changed`, which a trainer returns when the network's layers no longer match its optimizer state. Saving and loading add `.Invalid_File`, `.Unsupported_Version`, `.Read_Failed` and `.Write_Failed`.
 
 ### Networks
 
@@ -138,6 +139,20 @@ loss, step_err := ann.train_step(&trainer, &network, inputs, targets)
 - `predict_classes(network, inputs)` returns a `Tensor(int)` of argmax classes.
 - `one_hot(T, labels, classes)` builds `[len(labels), classes]` targets.
 
+### Saving and loading
+
+```odin
+ann.save(network, "model.bin") or_return
+restored := ann.load(f32, "model.bin") or_return
+defer ann.release(&restored)
+```
+
+- `save(network, path)` writes the network's input shape, each layer's kind, activation and sizes, and its parameters. `load(T, path, seed = 0, allocator)` rebuilds the network with the layer builders and fills in the parameters. `marshal` and `unmarshal` do the same with a byte slice instead of a file.
+- `T` is `f32` or `f64`, and either type loads a file saved from either one. `seed` is used only for weights of layers you add after loading.
+- A file that is truncated, has trailing bytes, or describes layers that do not fit together returns `.Invalid_File`. The size check happens before any parameter memory is allocated, so a corrupt file cannot trigger a huge allocation. A file from a newer format version returns `.Unsupported_Version`.
+- Optimizer state is not saved. Training a loaded network with a new trainer starts Adam's moment estimates from zero.
+- The format is little-endian, and its layout is documented at the top of `save.odin`.
+
 ## How training uses the tape
 
 Each step records the network on the trainer's tape. The input enters as a constant leaf (`tape_add_leaf_view`, no gradient). Every weight and bias enters as a borrowed leaf, and each dense layer becomes `tape_matmul` → `tape_add` → activation. Matmul and add broadcast, so leading batch axes need no special handling.
@@ -154,7 +169,7 @@ A Softmax in a hidden layer, or before mean-squared error, is recorded as `exp(x
 odin test . -vet -strict-style -define:ODIN_TEST_FAIL_ON_BAD_MEMORY=true
 ```
 
-The tests compare every loss's gradients, including a fused 3-D batch, a hidden softmax and a network using every image layer, against central finite differences in `f64`. Convolution and pooling are also checked against direct loops. They check that `fit` with in-order batches matches hand-sliced `train_step` calls bit for bit. A failing allocator drives every `.Allocation_Failed` path through building, training, evaluating and measuring a network, and the define makes any leak a failure.
+The tests compare every loss's gradients, including a fused 3-D batch, a hidden softmax and a network using every image layer, against central finite differences in `f64`. Convolution and pooling are also checked against direct loops. They check that `fit` with in-order batches matches hand-sliced `train_step` calls bit for bit. Saved networks are checked for exact round trips across every layer kind and both float types, and every truncation or corrupted header field of a saved file is rejected. A failing allocator drives every `.Allocation_Failed` path through building, training, evaluating, measuring, saving and loading a network, and the define makes any leak a failure.
 
 ```sh
 scripts/check_readme.sh
