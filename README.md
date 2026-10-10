@@ -88,7 +88,7 @@ Run these from the repository root:
 | `odin run examples/xor` | Binary cross-entropy, Adam, `print_summary`, and early stopping from the `on_epoch` callback. |
 | `odin run examples/sine -o:speed` | Regression with shuffled minibatches and a learning-rate schedule set from the callback, plotted as text. |
 | `odin run examples/spirals -o:speed` | Three-class softmax cross-entropy, `one_hot`, `accuracy`, and a decision map from one batched `predict_classes` call. |
-| `odin run examples/mnist -o:speed` | A convolutional network (`conv2d`, `max_pool2d`, `flatten`) on the MNIST digits, with test accuracy from `on_epoch` after each epoch. Run `scripts/fetch_mnist.sh` first to download the data, about 11 MB, into `data/mnist`. Three epochs take about a minute on one core and reach about 98.6% test accuracy. |
+| `odin run examples/mnist -o:speed` | A convolutional network (`conv2d`, `max_pool2d`, `flatten`) on the MNIST digits, with test accuracy from `on_epoch` after each epoch. Run `scripts/fetch_mnist.sh` first to download the data, about 11 MB, into `data/mnist`. Three epochs take under 40 seconds on one core and reach about 98.6% test accuracy. |
 
 ## API
 
