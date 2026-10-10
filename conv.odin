@@ -6,12 +6,12 @@ import tensor "../odin-tensor"
 // Image layers work on [height, width, channels] samples, channels last. Any
 // leading axes are batch axes, as for dense layers.
 //
-// A convolution is computed as a sum over kernel offsets. For each (dy, dx),
-// the input window [..., dy:dy+out_h, dx:dx+out_w, :] is a strided view, and
-// multiplying it by that offset's [input_channels, output_channels] slice of
-// the weights gives its contribution to every output position. Training
-// records the same views, products and sums on the tape, so forward and
-// train_step add the same terms in the same order and agree exactly.
+// A convolution gathers every input window into a row with im2col, giving
+// [positions, kernel²·input_channels] once the batch and spatial axes are
+// merged, and multiplies that by the weights viewed as
+// [kernel²·input_channels, output_channels]. Training records the same
+// im2col, product and bias add on the tape, so forward and train_step agree
+// exactly.
 
 // conv2d appends a valid, stride-1 convolution with square kernel_size
 // kernels. Its input must be [height, width, input_channels] with height and
@@ -74,68 +74,56 @@ flatten :: proc(network: ^Network($T)) -> Error where intrinsics.type_is_float(T
 	return _append_layer(network, Layer(T){kind = .Flatten, input_shape = input_shape, output_shape = _sample_shape(features)})
 }
 
+// _conv2d_shapes writes the shapes a convolution of input_shape works in:
+// the windows merged into [positions, kernel²·input_channels] rows, and the
+// output with input's batch axes.
+_conv2d_shapes :: proc(layer: Layer($T), input_shape: []int, rows_buffer: ^[2]int, output_buffer: []int) -> (rows, output: []int) {
+	height_axis := len(input_shape) - 3
+	columns := len(layer.weights.data) / layer.weights.shape[3]
+	rows_buffer^ = {-1, columns}
+	copy(output_buffer, input_shape[:height_axis])
+	sample := layer.output_shape
+	copy(output_buffer[height_axis:], _sample_dims(&sample))
+	return rows_buffer[:], output_buffer[:height_axis+3]
+}
+
 // _conv2d_forward computes a Conv2D layer's output before its activation.
 _conv2d_forward :: proc(layer: Layer($T), input: tensor.Tensor_View(T), allocator := context.allocator) -> (output: tensor.Tensor(T), err: Error) where intrinsics.type_is_float(T) {
-	kernel_size, input_channels := layer.weights.shape[0], layer.weights.shape[2]
-	output_height, output_width := layer.output_shape.dims[0], layer.output_shape.dims[1]
-	height_axis := len(input.shape) - 3
+	kernel_size := layer.weights.shape[0]
+	windows := tensor.im2col_views(input, kernel_size, kernel_size, 1, allocator) or_return
+	defer tensor.release(&windows)
+	rows_buffer: [2]int
+	output_buffer: [tensor.MAX_RANK]int
+	rows, output_shape := _conv2d_shapes(layer, input.shape, &rows_buffer, output_buffer[:])
+	tensor.reshape(&windows, rows) or_return
+
+	kernel_shape := [2]int{rows[1], layer.weights.shape[3]}
+	kernel_strides := [2]int{layer.weights.shape[3], 1}
+	kernels := tensor.Tensor_View(T){data = layer.weights.data, shape = kernel_shape[:], strides = kernel_strides[:]}
+	output = tensor.matmul_views(tensor.as_view(windows), kernels, allocator) or_return
 	defer if err != nil {
 		tensor.release(&output)
 	}
-	product: tensor.Tensor(T)
-	defer tensor.release(&product)
-
-	// The weights viewed as [kernel_size²·input_channels, output_channels],
-	// whose rows for offset (dy, dx) start at (dy*kernel_size + dx)*input_channels.
-	kernel_shape := [2]int{kernel_size * kernel_size * input_channels, layer.weights.shape[3]}
-	kernel_strides := [2]int{layer.weights.shape[3], 1}
-	kernels := tensor.Tensor_View(T){data = layer.weights.data, shape = kernel_shape[:], strides = kernel_strides[:]}
-
-	rows_shape, rows_strides, window_shape, window_strides: [tensor.MAX_RANK]int
-	offset_shape, offset_strides: [2]int
-	for dy in 0..<kernel_size {
-		rows := tensor.slice_view(input, height_axis, dy, output_height, 1, rows_shape[:], rows_strides[:]) or_return
-		for dx in 0..<kernel_size {
-			window := tensor.slice_view(rows, height_axis+1, dx, output_width, 1, window_shape[:], window_strides[:]) or_return
-			kernel := tensor.slice_view(kernels, 0, (dy*kernel_size+dx)*input_channels, input_channels, 1, offset_shape[:], offset_strides[:]) or_return
-			if dy == 0 && dx == 0 {
-				output = tensor.matmul_views(window, kernel, allocator) or_return
-				continue
-			}
-			if product.data == nil {
-				product = tensor.new_tensor(T, output.shape, allocator) or_return
-			}
-			tensor.matmul_views_into(&product, window, kernel) or_return
-			tensor.add_in_place(&output, product) or_return
-		}
-	}
 	tensor.add_in_place(&output, layer.bias) or_return
+	tensor.reshape(&output, output_shape) or_return
 	return output, nil
 }
 
-// _record_conv2d records a Conv2D layer before its activation, with the same
-// terms in the same order as _conv2d_forward.
+// _record_conv2d records a Conv2D layer before its activation, computing it
+// exactly as _conv2d_forward does.
 _record_conv2d :: proc(tape: ^tensor.Tape($T), layer: Layer(T), input, weights, bias: tensor.Tape_Value(T)) -> (output: tensor.Tape_Value(T), err: Error) where intrinsics.type_is_float(T) {
-	kernel_size, input_channels := layer.weights.shape[0], layer.weights.shape[2]
-	output_height, output_width := layer.output_shape.dims[0], layer.output_shape.dims[1]
+	kernel_size := layer.weights.shape[0]
 	value := tensor.tape_value(tape, input) or_return
-	height_axis := len(value.shape) - 3
+	rows_buffer: [2]int
+	output_buffer: [tensor.MAX_RANK]int
+	rows, output_shape := _conv2d_shapes(layer, value.shape, &rows_buffer, output_buffer[:])
 
-	kernels := tensor.tape_reshape(tape, weights, []int{kernel_size * kernel_size * input_channels, -1}) or_return
-	for dy in 0..<kernel_size {
-		rows := tensor.tape_slice(tape, input, height_axis, dy, output_height) or_return
-		for dx in 0..<kernel_size {
-			window := tensor.tape_slice(tape, rows, height_axis+1, dx, output_width) or_return
-			kernel := tensor.tape_slice(tape, kernels, 0, (dy*kernel_size+dx)*input_channels, input_channels) or_return
-			product := tensor.tape_matmul(tape, window, kernel) or_return
-			if dy == 0 && dx == 0 {
-				output = product
-			} else {
-				output = tensor.tape_add(tape, output, product) or_return
-			}
-		}
-	}
-	return tensor.tape_add(tape, output, bias)
+	windows := tensor.tape_im2col(tape, input, kernel_size, kernel_size) or_return
+	windows = tensor.tape_reshape(tape, windows, rows) or_return
+	kernels := tensor.tape_reshape(tape, weights, []int{rows[1], -1}) or_return
+	product := tensor.tape_matmul(tape, windows, kernels) or_return
+	output = tensor.tape_add(tape, product, bias) or_return
+	return tensor.tape_reshape(tape, output, output_shape)
 }
 
 // _pool_blocks_shape writes the shape that splits [..., height, width, c] into
