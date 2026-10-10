@@ -6,9 +6,11 @@
 //
 // spec.txt describes the network as builder calls: an optional "input h w c"
 // line, then "dense in out activation", "conv2d in_channels out_channels
-// kernel activation", "max_pool2d size" and "flatten" lines in order. Weights
-// and biases are read and written as w<i>.bin and b<i>.bin, where i is the
-// layer's index; layers without parameters have none.
+// kernel activation", "max_pool2d size", "flatten" and "batch_norm features
+// activation" lines in order. Weights and biases, a batch norm's scale and
+// shift, are read and written as w<i>.bin and b<i>.bin, where i is the
+// layer's index; layers without parameters have none. A batch norm's running
+// mean and variance are written as m<i>.bin and v<i>.bin after training.
 //
 // The program loads the network and data, writes the forward output, the loss
 // from every training step and the final parameters, then times forward and
@@ -40,8 +42,8 @@ Spec :: struct {
 }
 
 // Layer_Spec holds one builder call. sizes are dense's inputs and outputs,
-// conv2d's input channels, output channels and kernel size, or max_pool2d's
-// pool size.
+// conv2d's input channels, output channels and kernel size, max_pool2d's
+// pool size, or batch_norm's features.
 Layer_Spec :: struct {
 	kind:       ann.Layer_Kind,
 	sizes:      [3]int,
@@ -97,8 +99,15 @@ run :: proc($T: typeid, dir: string, spec: Spec) -> ann.Error {
 			ann.max_pool2d(&network, layer.sizes[0]) or_return
 		case .Flatten:
 			ann.flatten(&network) or_return
+		case .Batch_Norm:
+			ann.batch_norm(&network, layer.activation) or_return
+			if len(network.layers[i].weights.data) != layer.sizes[0] {
+				return .Shape_Mismatch
+			}
+		case .Dropout:
+			return .Invalid_Hyperparameter // masks cannot match PyTorch's
 		}
-		if layer.kind == .Dense || layer.kind == .Conv2D {
+		if len(network.layers[i].weights.data) > 0 {
 			load_into(dir, fmt.tprintf("w%d.bin", i), network.layers[i].weights.data) or_return
 			load_into(dir, fmt.tprintf("b%d.bin", i), network.layers[i].bias.data) or_return
 		}
@@ -130,9 +139,13 @@ run :: proc($T: typeid, dir: string, spec: Spec) -> ann.Error {
 	}
 	save(dir, "out_losses.bin", losses)
 	for layer, i in network.layers {
-		if layer.kind == .Dense || layer.kind == .Conv2D {
+		if len(layer.weights.data) > 0 {
 			save(dir, fmt.tprintf("out_w%d.bin", i), layer.weights.data)
 			save(dir, fmt.tprintf("out_b%d.bin", i), layer.bias.data)
+		}
+		if layer.kind == .Batch_Norm {
+			save(dir, fmt.tprintf("out_m%d.bin", i), layer.running_mean.data)
+			save(dir, fmt.tprintf("out_v%d.bin", i), layer.running_variance.data)
 		}
 	}
 
@@ -202,9 +215,9 @@ parse_spec :: proc(dir: string) -> (spec: Spec, ok: bool) {
 			for field in f[1:] {
 				append(&spec.input_shape, atoi(field))
 			}
-		case "dense", "conv2d":
+		case "dense", "conv2d", "batch_norm":
 			// The activation follows the sizes.
-			layer := Layer_Spec{kind = .Dense if f[0] == "dense" else .Conv2D}
+			layer := Layer_Spec{kind = .Dense if f[0] == "dense" else .Conv2D if f[0] == "conv2d" else .Batch_Norm}
 			for field, i in f[1:len(f)-1] {
 				layer.sizes[i] = atoi(field)
 			}

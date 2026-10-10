@@ -1,11 +1,12 @@
 # odin-ann
 
-A small Odin neural-network library built on the [`odin-tensor`](https://github.com/wardjm/odin-tensor) package. It covers sequential dense networks, five activations, three losses, SGD with momentum and Adam/AdamW, a minibatch training loop, and saving networks to files. Gradients come from the tensor library's reverse-mode autodiff tape.
+A small Odin neural-network library built on the [`odin-tensor`](https://github.com/wardjm/odin-tensor) package. It covers sequential dense and convolutional networks, dropout and batch normalization, five activations, three losses, SGD with momentum and Adam/AdamW, a minibatch training loop, and saving networks to files. Gradients come from the tensor library's reverse-mode autodiff tape.
 
 ## Features
 
 - Dense layers with Identity, ReLU, Sigmoid, Tanh and Softmax activations, generic over `f32` or `f64`. Weights are drawn from a seeded generator, with He scaling for ReLU and Glorot otherwise.
 - Image layers on channels-last `[height, width, channels]` samples: valid, stride-1 `conv2d`, non-overlapping `max_pool2d`, and `flatten` to feed a dense layer.
+- `dropout` and `batch_norm`, which act one way while training and another during inference.
 - `forward` takes a single sample `[features]`, a batch `[batch, features]`, or any number of leading batch axes. A `[2, 5, features]` input gives `[2, 5, outputs]`.
 - Mean-squared error, binary cross-entropy and categorical cross-entropy. The cross-entropy losses work from the final layer's logits, so they stay finite when outputs saturate.
 - `SGD` (optional momentum) and `Adam` (bias-corrected; a nonzero `weight_decay` makes it AdamW), with learning-rate changes between steps.
@@ -104,7 +105,9 @@ Every fallible procedure returns `ann.Error`, a `#shared_nil` union of `tensor.T
 - `dense(&network, inputs, outputs, activation = .Identity)` appends a fully connected layer and returns `.Shape_Mismatch` unless its input is `[inputs]`.
 - `conv2d(&network, input_channels, output_channels, kernel_size, activation = .Identity)` appends a valid, stride-1 convolution with square kernels. `[h, w, input_channels]` becomes `[h-kernel_size+1, w-kernel_size+1, output_channels]`; weights are `[kernel_size, kernel_size, input_channels, output_channels]` and biases `[output_channels]`.
 - `max_pool2d(&network, pool_size = 2)` takes the maximum of each non-overlapping `pool_size` × `pool_size` window, so `[h, w, c]` becomes `[h/pool_size, w/pool_size, c]`, rounding down. `flatten(&network)` turns each sample into one vector in row-major order. Neither has parameters.
-- Each `Layer(T)` holds its `kind`, `weights`, `bias`, `activation`, `pool_size`, and the `input_shape` and `output_shape` of one sample. The parameters are ordinary tensors, so you can set or load them directly.
+- `dropout(&network, rate)` zeroes each value with probability `rate` while training and scales the rest by `1/(1-rate)`. During inference it passes values through unchanged. `rate` must be in [0, 1).
+- `batch_norm(&network, activation = .Identity, momentum = 0.1, epsilon = 1e-5)` normalizes the last axis: features after a dense layer, channels after a convolution. While training, it uses the batch's mean and variance over every other axis, then applies a trainable scale and shift that start at 1 and 0, held in `weights` and `bias`. Each step also moves `running_mean` and the unbiased `running_variance` `momentum` of the way toward the batch values. During inference it normalizes with those running values instead. This matches PyTorch's `BatchNorm1d` and `BatchNorm2d`. For the usual convolution → batch norm → ReLU order, give the convolution `.Identity` and the batch norm `.ReLU`. The bias of the layer just before a batch norm has no effect, because normalizing subtracts it again.
+- Each `Layer(T)` holds its `kind`, `weights`, `bias`, `activation`, the settings of its kind (`pool_size`, `rate`, `momentum`, `epsilon`), a batch norm's running statistics, and the `input_shape` and `output_shape` of one sample. The parameters are ordinary tensors, so you can set or load them directly.
 - `input_features_of` and `output_features_of` give the last axis of one input or output sample. `parameter_count` and `print_summary` describe a network.
 - `forward(network, input, allocator)` and `forward_views` return a new tensor owned by the caller. The input's trailing axes must match the network's `input_shape`; any leading axes are batch axes, so a batch of MNIST images is `[batch, 28, 28, 1]`. Each dense layer allocates one tensor and applies its bias and activation in place.
 - `activate_in_place` and `softmax_in_place` apply an activation to any tensor. Softmax normalizes over the last axis and subtracts the row maximum first.
@@ -117,7 +120,7 @@ Every fallible procedure returns `ann.Error`, a `#shared_nil` union of `tensor.T
 | `.Binary_Cross_Entropy` | `.Sigmoid` | values in [0, 1] |
 | `.Cross_Entropy` | `.Softmax` | each row a distribution over the last axis, such as `one_hot(T, labels, classes)` |
 
-Each loss averages over the batch. The two cross-entropy losses replace the final activation with a stable formula on its logits: `max(z, 0) - z*y + log(1 + exp(-|z|))` for binary and log-sum-exp for categorical. Any other pairing returns `.Loss_Activation_Mismatch`. `evaluate(network, loss, inputs, targets)` computes the loss exactly as training does, without changing anything. `mean_squared_error(predictions, targets)` works on any two tensors.
+Each loss averages over the batch. The two cross-entropy losses replace the final activation with a stable formula on its logits: `max(z, 0) - z*y + log(1 + exp(-|z|))` for binary and log-sum-exp for categorical. Any other pairing returns `.Loss_Activation_Mismatch`. `evaluate(network, loss, inputs, targets)` computes the loss without changing anything. It runs the network in inference mode, as `forward` does, so it equals the training loss exactly only for networks without dropout or batch norm. `mean_squared_error(predictions, targets)` works on any two tensors.
 
 ### Training
 
@@ -128,8 +131,8 @@ loss, step_err := ann.train_step(&trainer, &network, inputs, targets)
 ```
 
 - `sgd(learning_rate, momentum = 0, weight_decay = 0)` and `adam(learning_rate = 0.001, beta1 = 0.9, beta2 = 0.999, epsilon = 1e-8, weight_decay = 0)` build an `Optimizer`, a union of the `SGD` and `Adam` structs. Weight decay is decoupled: each step scales parameters by `1 - learning_rate*weight_decay`. Out-of-range values return `.Invalid_Hyperparameter` from `trainer_init`.
-- A `Trainer(T)` owns one autodiff tape, which it resets and rebuilds every step, and the optimizer's moment buffers, which it creates on the first step. You pass the network to each call instead of storing it in the trainer, so the network can move freely. If you add or reshape layers afterwards, `train_step` returns `.Network_Changed`.
-- `train_step(&trainer, &network, inputs, targets)` runs forward, backward and one optimizer update. Its result is the loss from before the update. `train_step_views` takes borrowed views. `trainer.steps` counts updates, and `set_learning_rate` changes the step size without resetting the moment buffers.
+- `trainer_init(T, loss, optimizer, allocator, seed = 0)` creates a `Trainer(T)`. `seed` starts the generator that draws dropout masks. The trainer owns one autodiff tape, which it resets and rebuilds every step, and the optimizer's moment buffers, which it creates on the first step. You pass the network to each call instead of storing it in the trainer, so the network can move freely. If you add or reshape layers afterwards, `train_step` returns `.Network_Changed`.
+- `train_step(&trainer, &network, inputs, targets)` runs forward in training mode, then backward and one optimizer update. Training mode means dropout masks values, and batch norm uses batch statistics and updates its running ones. Its result is the loss from before the update. `train_step_views` takes borrowed views. `trainer.steps` counts updates, and `set_learning_rate` changes the step size without resetting the moment buffers.
 - Training and inference run on one thread unless you call odin-tensor's `tensor.set_thread_count(n)`. Matrix products, element-wise work, `im2col` and pooling are then split across `n` threads, forward and backward, with identical results. Dense layers with hundreds of units or more gain the most: a 1024-1024-1024 MLP trains about 4× faster on 8 cores. The MNIST CNN's step gains about 1.4×, because its batches are small and its weight-gradient products split poorly.
 - `fit(&trainer, &network, inputs, targets, options)` trains over a dataset whose first axis indexes samples and returns the mean loss of the last epoch. `Fit_Options` sets `epochs`, `batch_size` (0 means the whole dataset), and `shuffle` with `seed`. It also takes `on_epoch(epoch, loss, user_data) -> bool`, which runs after each epoch; returning false stops early. In-order batches are zero-copy `slice_view`s of the dataset. Shuffled batches are copied into two reused buffers.
 
@@ -159,6 +162,8 @@ Each step records the network on the trainer's tape. The input enters as a const
 
 A convolution is `tape_im2col`, which gathers each output position's input window into one row, then a single `tape_matmul` of those rows by the weights viewed as `[kernel_size²·input_channels, output_channels]`, and a bias `tape_add`. `forward` computes the same product the same way, so it agrees with training exactly. Max pooling is `tape_max_pool2d`, and `flatten` is a `tape_reshape`.
 
+Dropout multiplies by a constant leaf of zeros and `1/(1-rate)`. Batch norm views its input as `[samples, features]`, then records `tape_mean_axis`, the centered values, their mean square, `tape_sqrt` of that plus epsilon, a divide, and the scale and shift. The batch statistics come from the recorded values, so the gradient flows through the mean and variance as well.
+
 The loss itself is never recorded. Its value and its gradient with respect to the network output are computed directly with tensor kernels. That gradient seeds `tape_backward_with_seed` at the output, or at the final logits for the cross-entropy losses. The fused gradients are `sigmoid(z) - y` and `softmax(z) * sum(y) - y`, computed exactly, without differentiating through `log(sigmoid)`.
 
 A Softmax in a hidden layer, or before mean-squared error, is recorded as `exp(x - max) / sum`. The row maximum enters as a constant leaf, which is exact because softmax ignores a per-row shift.
@@ -169,7 +174,7 @@ A Softmax in a hidden layer, or before mean-squared error, is recorded as `exp(x
 odin test . -vet -strict-style -define:ODIN_TEST_FAIL_ON_BAD_MEMORY=true
 ```
 
-The tests compare every loss's gradients, including a fused 3-D batch, a hidden softmax and a network using every image layer, against central finite differences in `f64`. Convolution and pooling are also checked against direct loops. They check that `fit` with in-order batches matches hand-sliced `train_step` calls bit for bit. Saved networks are checked for exact round trips across every layer kind and both float types, and every truncation or corrupted header field of a saved file is rejected. A failing allocator drives every `.Allocation_Failed` path through building, training, evaluating, measuring, saving and loading a network, and the define makes any leak a failure.
+The tests compare every loss's gradients, including a fused 3-D batch, a hidden softmax, a network using every image layer, and one with batch norm after a convolution and a dense layer plus dropout between them, against central finite differences in `f64`. The finite differences use the training loss with the same dropout masks. Batch norm's normalization, running statistics and inference output are checked against direct formulas. Convolution and pooling are also checked against direct loops. They check that `fit` with in-order batches matches hand-sliced `train_step` calls bit for bit. Saved networks are checked for exact round trips across every layer kind and both float types, and every truncation or corrupted header field of a saved file is rejected. A failing allocator drives every `.Allocation_Failed` path through building, training, evaluating, measuring, saving and loading a network, with and without dropout and batch norm, and the define makes any leak a failure.
 
 ```sh
 scripts/check_readme.sh

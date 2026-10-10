@@ -50,12 +50,25 @@ Trainer :: struct($T: typeid) {
 	// Adam's uncentered variance. Both are allocated on the first step.
 	first_moment:  [dynamic]tensor.Tensor(T),
 	second_moment: [dynamic]tensor.Tensor(T),
+	// rng draws dropout masks.
+	rng:           rand.Default_Random_State,
 	allocator:     mem.Allocator,
 }
 
-trainer_init :: proc($T: typeid, loss: Loss, optimizer: Optimizer, allocator := context.allocator) -> (trainer: Trainer(T), err: Error) where intrinsics.type_is_float(T) {
+// _Training is what recording a layer for training needs beyond the layer:
+// the generator for dropout masks, and whether batch normalization updates
+// its running statistics.
+_Training :: struct {
+	rng:               ^rand.Default_Random_State,
+	update_statistics: bool,
+}
+
+// trainer_init creates a trainer for loss and optimizer. seed starts the
+// generator that draws dropout masks.
+trainer_init :: proc($T: typeid, loss: Loss, optimizer: Optimizer, allocator := context.allocator, seed: u64 = 0) -> (trainer: Trainer(T), err: Error) where intrinsics.type_is_float(T) {
 	_check_optimizer(optimizer) or_return
 	trainer.tape = tensor.tape_init(T, 64, allocator) or_return
+	trainer.rng = rand.create(seed)
 	trainer.loss = loss
 	trainer.optimizer = optimizer
 	trainer.parameters = make([dynamic]tensor.Tape_Value(T), allocator)
@@ -98,13 +111,14 @@ train_step :: proc(trainer: ^Trainer($T), network: ^Network(T), inputs, targets:
 
 // train_step_views is train_step for borrowed views, such as minibatch slices.
 train_step_views :: proc(trainer: ^Trainer($T), network: ^Network(T), inputs, targets: tensor.Tensor_View(T)) -> (loss: T, err: Error) where intrinsics.type_is_float(T) {
-	loss = _backward(trainer, network^, inputs, targets) or_return
+	loss = _backward(trainer, network^, inputs, targets, true) or_return
 	_apply_optimizer(trainer, network) or_return
 	return loss, nil
 }
 
-// evaluate measures loss without training, computing it exactly as train_step
-// does.
+// evaluate measures loss without training. It runs the network as forward
+// does, so for networks without Dropout or Batch_Norm layers it computes the
+// loss exactly as train_step does.
 evaluate :: proc(network: Network($T), loss: Loss, inputs, targets: tensor.Tensor(T), allocator := context.allocator) -> (T, Error) where intrinsics.type_is_float(T) {
 	return evaluate_views(network, loss, tensor.as_view(inputs), tensor.as_view(targets), allocator)
 }
@@ -121,8 +135,9 @@ evaluate_views :: proc(network: Network($T), loss: Loss, inputs, targets: tensor
 // _backward rebuilds the tape for one batch and leaves each parameter's
 // gradient on it. The loss itself is not recorded: its gradient seeds the
 // backward pass at the network output, or at the final logits for losses that
-// absorb the last activation.
-_backward :: proc(trainer: ^Trainer($T), network: Network(T), inputs, targets: tensor.Tensor_View(T)) -> (loss: T, err: Error) where intrinsics.type_is_float(T) {
+// absorb the last activation. update_statistics lets batch normalization
+// update its running statistics.
+_backward :: proc(trainer: ^Trainer($T), network: Network(T), inputs, targets: tensor.Tensor_View(T), update_statistics: bool) -> (loss: T, err: Error) where intrinsics.type_is_float(T) {
 	_check_loss(network, trainer.loss) or_return
 	_check_input(network, inputs.shape) or_return
 	tape := &trainer.tape
@@ -130,7 +145,8 @@ _backward :: proc(trainer: ^Trainer($T), network: Network(T), inputs, targets: t
 	clear(&trainer.parameters)
 
 	input := tensor.tape_add_leaf_view(tape, inputs, false) or_return
-	output := _record_forward(tape, network, input, &trainer.parameters, _loss_uses_logits(trainer.loss)) or_return
+	training := _Training{rng = &trainer.rng, update_statistics = update_statistics}
+	output := _record_forward(tape, network, input, &trainer.parameters, _loss_uses_logits(trainer.loss), training) or_return
 	prediction := tensor.tape_value(tape, output) or_return
 	gradient: tensor.Tensor(T)
 	loss, gradient = _loss_and_gradient(trainer.loss, prediction, targets, true, trainer.allocator) or_return
@@ -141,7 +157,7 @@ _backward :: proc(trainer: ^Trainer($T), network: Network(T), inputs, targets: t
 
 // _record_forward records every layer and its activation. Parameters are
 // borrowed leaves, appended to parameters in _layer_parameters order.
-_record_forward :: proc(tape: ^tensor.Tape($T), network: Network(T), input: tensor.Tape_Value(T), parameters: ^[dynamic]tensor.Tape_Value(T), skip_last_activation: bool) -> (output: tensor.Tape_Value(T), err: Error) where intrinsics.type_is_float(T) {
+_record_forward :: proc(tape: ^tensor.Tape($T), network: Network(T), input: tensor.Tape_Value(T), parameters: ^[dynamic]tensor.Tape_Value(T), skip_last_activation: bool, training: _Training) -> (output: tensor.Tape_Value(T), err: Error) where intrinsics.type_is_float(T) {
 	output = input
 	for &layer, i in network.layers {
 		buffer: [2]^tensor.Tensor(T)
@@ -152,7 +168,7 @@ _record_forward :: proc(tape: ^tensor.Tape($T), network: Network(T), input: tens
 				return output, .Allocation_Failed
 			}
 		}
-		output = _record_layer(tape, layer, output, parameters[first:]) or_return
+		output = _record_layer(tape, layer, output, parameters[first:], training) or_return
 		if !(skip_last_activation && i == len(network.layers)-1) {
 			output = _record_activation(tape, output, layer.activation) or_return
 		}
@@ -162,7 +178,7 @@ _record_forward :: proc(tape: ^tensor.Tape($T), network: Network(T), input: tens
 
 // _record_layer records one layer before its activation. parameters are the
 // layer's leaves on tape, in _layer_parameters order.
-_record_layer :: proc(tape: ^tensor.Tape($T), layer: Layer(T), input: tensor.Tape_Value(T), parameters: []tensor.Tape_Value(T)) -> (output: tensor.Tape_Value(T), err: Error) where intrinsics.type_is_float(T) {
+_record_layer :: proc(tape: ^tensor.Tape($T), layer: Layer(T), input: tensor.Tape_Value(T), parameters: []tensor.Tape_Value(T), training: _Training) -> (output: tensor.Tape_Value(T), err: Error) where intrinsics.type_is_float(T) {
 	switch layer.kind {
 	case .Dense:
 		product := tensor.tape_matmul(tape, input, parameters[0]) or_return
@@ -173,6 +189,10 @@ _record_layer :: proc(tape: ^tensor.Tape($T), layer: Layer(T), input: tensor.Tap
 		output = _record_max_pool2d(tape, layer, input) or_return
 	case .Flatten:
 		output = _record_flatten(tape, layer, input) or_return
+	case .Dropout:
+		output = _record_dropout(tape, layer, input, training) or_return
+	case .Batch_Norm:
+		output = _record_batch_norm(tape, layer, input, parameters[0], parameters[1], training) or_return
 	}
 	return output, nil
 }

@@ -32,8 +32,10 @@ ROOT = Path(__file__).resolve().parent.parent
 
 # Layers mirror odin-ann's builders: ("dense", inputs, outputs, activation),
 # ("conv2d", in_channels, out_channels, kernel, activation), ("max_pool2d",
-# size) and ("flatten",). Image samples are channels-last [h, w, c], as in
-# odin-ann; PyTorch's half converts to and from its channels-first layout.
+# size), ("flatten",) and ("batch_norm", features, activation). Image samples
+# are channels-last [h, w, c], as in odin-ann; PyTorch's half converts to and
+# from its channels-first layout. Batch normalization uses odin-ann's
+# defaults, momentum 0.1 and epsilon 1e-5, which are also PyTorch's.
 
 
 def dense_layers(sizes, activations):
@@ -98,6 +100,21 @@ CASES = [
          batch=64, input_shape=[28, 28, 1], fwd_reps=20),
     # Odd sizes leave a row and column for the pool to drop, and the second
     # convolution sees several input channels with a non-square image.
+    # Batch normalization trains on batch statistics; the forward output is
+    # checked before training, with the initial running statistics, and the
+    # running statistics after the last step are compared with the parameters.
+    # A bias directly before batch normalization has a zero gradient, which
+    # each library computes as different rounding noise, and Adam scales that
+    # noise up to full steps. So the Adam cases put a ReLU in between.
+    Case("batch_norm_mlp_f64", "f64", [("dense", 20, 32, "ReLU"), ("batch_norm", 32, "Identity"),
+                                       ("dense", 32, 5, "Softmax")], "Cross_Entropy",
+         ("adam", 1e-2, 0.9, 0.999, 1e-8, 0.01), batch=64),
+    Case("batch_norm_mlp_f32", "f32", [("dense", 20, 32, "ReLU"), ("batch_norm", 32, "Identity"),
+                                       ("dense", 32, 5, "Softmax")], "Cross_Entropy",
+         ("adam", 1e-2, 0.9, 0.999, 1e-8, 0.01), batch=64),
+    Case("batch_norm_cnn_f64", "f64", [("conv2d", 3, 6, 3, "Identity"), ("batch_norm", 6, "Tanh"), ("max_pool2d", 2),
+                                       ("flatten",), ("dense", 96, 4, "Identity")], "Mean_Squared_Error",
+         ("sgd", 0.05, 0.9), batch=16, input_shape=[10, 10, 3]),
     Case("odd_cnn_f64", "f64", [("conv2d", 3, 4, 3, "Tanh"), ("max_pool2d", 2), ("conv2d", 4, 5, 2, "Sigmoid"),
                                 ("flatten",), ("dense", 30, 3, "Identity")], "Mean_Squared_Error",
          ("sgd", 0.05, 0.9), batch=16, input_shape=[11, 9, 3]),
@@ -122,6 +139,10 @@ def make_data(case, rng):
             shape, fan = (layer[1], layer[2]), layer[1] + layer[2]
         elif layer[0] == "conv2d":
             shape, fan = (layer[3], layer[3], layer[1], layer[2]), layer[3] ** 2 * (layer[1] + layer[2])
+        elif layer[0] == "batch_norm":
+            parameters[i] = (rng.uniform(0.5, 1.5, layer[1]).astype(np_dtype),
+                             rng.uniform(-0.1, 0.1, layer[1]).astype(np_dtype))
+            continue
         else:
             continue
         limit = np.sqrt(6.0 / fan)
@@ -161,9 +182,11 @@ def write_case(case, directory, parameters, x, y, threads):
     y.tofile(directory / "y.bin")
 
 
-def torch_forward(case, params, x, logits):
+def torch_forward(case, params, x, logits, stats, training):
     """Runs the network on odin-ann-layout parameters (a dict from layer index
-    to (weights, bias)); with logits set, skips the final activation."""
+    to (weights, bias)); with logits set, skips the final activation. stats
+    maps each batch_norm layer's index to its running (mean, variance), which
+    training updates and otherwise normalizes with."""
     h = x.permute(0, 3, 1, 2) if len(case.input_shape) == 3 else x  # to NCHW
     for i, layer in enumerate(case.layers):
         kind, last = layer[0], i == len(case.layers) - 1
@@ -175,17 +198,21 @@ def torch_forward(case, params, x, logits):
             h = F.conv2d(h, w.permute(3, 2, 0, 1), b)
         elif kind == "max_pool2d":
             h = F.max_pool2d(h, layer[1])
+        elif kind == "batch_norm":
+            w, b = params[i]
+            mean, variance = stats[i]
+            h = F.batch_norm(h, mean, variance, w, b, training=training, momentum=0.1, eps=1e-5)
         else:
             h = h.permute(0, 2, 3, 1).flatten(1)  # odin-ann flattens channels last
-        if kind in ("dense", "conv2d") and not (logits and last):
-            h = torch_activation(layer[-1], h, dim=1 if kind == "conv2d" else -1)
+        if kind in ("dense", "conv2d", "batch_norm") and not (logits and last):
+            h = torch_activation(layer[-1], h, dim=1 if h.dim() == 4 else -1)
     return h
 
 
-def torch_loss(case, params, x, y):
+def torch_loss(case, params, x, y, stats):
     if case.loss == "Mean_Squared_Error":
-        return F.mse_loss(torch_forward(case, params, x, False), y)
-    z = torch_forward(case, params, x, True)
+        return F.mse_loss(torch_forward(case, params, x, False, stats, True), y)
+    z = torch_forward(case, params, x, True, stats, True)
     if case.loss == "Binary_Cross_Entropy":
         return F.binary_cross_entropy_with_logits(z, y)
     return F.cross_entropy(z, y)  # y holds probabilities; averages over rows
@@ -215,24 +242,30 @@ def run_torch(case, parameters, x_np, y_np):
               for i, (w, b) in parameters.items()}
     flat = [p for pair in params.values() for p in pair]
     x, y = torch.from_numpy(x_np), torch.from_numpy(y_np)
+    stats = {i: (torch.zeros(layer[1], dtype=x.dtype), torch.ones(layer[1], dtype=x.dtype))
+             for i, layer in enumerate(case.layers) if layer[0] == "batch_norm"}
 
     with torch.no_grad():
-        forward = torch_forward(case, params, x, False).numpy().copy()
+        forward = torch_forward(case, params, x, False, stats, False).numpy().copy()
     optimizer = make_optimizer(case, flat)
 
     def step():
         optimizer.zero_grad(set_to_none=True)
-        loss = torch_loss(case, params, x, y)
+        loss = torch_loss(case, params, x, y, stats)
         loss.backward()
         optimizer.step()
         return loss.item()
 
     losses = np.array([step() for _ in range(case.steps)])
-    final = [p.detach().numpy().copy() for p in flat]
+    final = []
+    for i, (w, b) in params.items():
+        final += [w.detach().numpy().copy(), b.detach().numpy().copy()]
+        if i in stats:
+            final += [s.numpy().copy() for s in stats[i]]
 
     def forward_only():
         with torch.no_grad():
-            torch_forward(case, params, x, False)
+            torch_forward(case, params, x, False, stats, False)
 
     timing = {"forward_ms": median_ms(forward_only, case.fwd_reps),
               "train_step_ms": median_ms(step, case.train_reps)}
@@ -250,6 +283,9 @@ def run_odin(case, binary, directory, parameters):
     for i in parameters:
         final.append(np.fromfile(directory / f"out_w{i}.bin", dtype=np_dtype))
         final.append(np.fromfile(directory / f"out_b{i}.bin", dtype=np_dtype))
+        if case.layers[i][0] == "batch_norm":
+            final.append(np.fromfile(directory / f"out_m{i}.bin", dtype=np_dtype))
+            final.append(np.fromfile(directory / f"out_v{i}.bin", dtype=np_dtype))
     timing = {}
     for line in (directory / "timing.txt").read_text().splitlines():
         key, value = line.split()

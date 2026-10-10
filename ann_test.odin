@@ -2,6 +2,7 @@ package ann
 
 import "core:fmt"
 import "core:math"
+import "core:math/rand"
 import "core:mem"
 import "core:testing"
 import tensor "../odin-tensor"
@@ -140,13 +141,22 @@ test_softmax_rows_are_stable_distributions :: proc(t: ^testing.T) {
 }
 
 // check_gradients compares the gradients train_step would apply against
-// central differences of evaluate.
+// central differences of the training loss. A second trainer with the same
+// seed measures the loss, so every pass draws the same dropout masks, and
+// neither updates batch normalization's running statistics.
 check_gradients :: proc(t: ^testing.T, network: ^Network(f64), loss: Loss, inputs, targets: tensor.Tensor(f64), loc := #caller_location) {
-	trainer, trainer_err := trainer_init(f64, loss, sgd(0))
+	trainer, trainer_err := trainer_init(f64, loss, sgd(0), seed = 9)
 	require_ok(t, trainer_err, loc)
 	defer trainer_release(&trainer)
-	_, backward_err := _backward(&trainer, network^, tensor.as_view(inputs), tensor.as_view(targets))
+	_, backward_err := _backward(&trainer, network^, tensor.as_view(inputs), tensor.as_view(targets), false)
 	require_ok(t, backward_err, loc)
+	probe, probe_err := trainer_init(f64, loss, sgd(0))
+	require_ok(t, probe_err, loc)
+	defer trainer_release(&probe)
+	training_loss :: proc(probe: ^Trainer(f64), network: Network(f64), inputs, targets: tensor.Tensor(f64)) -> (f64, Error) {
+		probe.rng = rand.create(9)
+		return _backward(probe, network, tensor.as_view(inputs), tensor.as_view(targets), false)
+	}
 
 	step :: 1e-6
 	slot := 0
@@ -159,9 +169,9 @@ check_gradients :: proc(t: ^testing.T, network: ^Network(f64), loss: Loss, input
 			for j in 0..<len(parameter.data) {
 				saved := parameter.data[j]
 				parameter.data[j] = saved + step
-				plus, plus_err := evaluate(network^, loss, inputs, targets)
+				plus, plus_err := training_loss(&probe, network^, inputs, targets)
 				parameter.data[j] = saved - step
-				minus, minus_err := evaluate(network^, loss, inputs, targets)
+				minus, minus_err := training_loss(&probe, network^, inputs, targets)
 				parameter.data[j] = saved
 				require_ok(t, plus_err, loc)
 				require_ok(t, minus_err, loc)

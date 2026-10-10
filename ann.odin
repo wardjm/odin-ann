@@ -63,6 +63,12 @@ Layer_Kind :: enum {
 	Max_Pool2D,
 	// Collapses a sample into one vector, so a Dense layer can follow.
 	Flatten,
+	// Zeroes a random fraction of values while training; the identity
+	// otherwise.
+	Dropout,
+	// Normalizes each feature, the last axis, over the batch while training,
+	// and with running statistics otherwise.
+	Batch_Norm,
 }
 
 // MAX_SAMPLE_RANK bounds the rank of one sample's shape, such as [features]
@@ -76,17 +82,27 @@ Sample_Shape :: struct {
 }
 
 Layer :: struct($T: typeid) {
-	kind:         Layer_Kind,
-	// weights and bias are empty for Max_Pool2D and Flatten.
-	weights:      tensor.Tensor(T), // Dense: [input_features, output_features]; Conv2D: [kernel, kernel, input_channels, output_channels]
-	bias:         tensor.Tensor(T), // Dense: [output_features]; Conv2D: [output_channels]
-	activation:   Activation,
+	kind:             Layer_Kind,
+	// weights and bias are empty for Max_Pool2D, Flatten and Dropout.
+	weights:          tensor.Tensor(T), // Dense: [input_features, output_features]; Conv2D: [kernel, kernel, input_channels, output_channels]; Batch_Norm: the scale, [features]
+	bias:             tensor.Tensor(T), // Dense: [output_features]; Conv2D: [output_channels]; Batch_Norm: the shift, [features]
+	activation:       Activation,
 	// pool_size is a Max_Pool2D window's side, which is also its stride.
-	pool_size:    int,
+	pool_size:        int,
+	// rate is the fraction of values a Dropout layer zeroes while training.
+	rate:             f64,
+	// A Batch_Norm layer's running estimates of each feature's mean and
+	// variance, which it normalizes with outside training. Each training step
+	// moves them momentum of the way to the batch's statistics. epsilon is
+	// added to every variance before its square root.
+	running_mean:     tensor.Tensor(T),
+	running_variance: tensor.Tensor(T),
+	momentum:         f64,
+	epsilon:          f64,
 	// input_shape and output_shape are one sample's shape before and after
 	// this layer.
-	input_shape:  Sample_Shape,
-	output_shape: Sample_Shape,
+	input_shape:      Sample_Shape,
+	output_shape:     Sample_Shape,
 }
 
 // Network is an ordered sequence of layers. It owns its parameters; treat
@@ -111,8 +127,7 @@ new_network :: proc($T: typeid, seed: u64 = 0, allocator := context.allocator) -
 // release frees all layer parameters and the layer list.
 release :: proc(network: ^Network($T)) {
 	for &layer in network.layers {
-		tensor.release(&layer.weights)
-		tensor.release(&layer.bias)
+		_release_layer(&layer)
 	}
 	delete(network.layers)
 	network^ = {}
@@ -193,8 +208,7 @@ _fill_uniform :: proc(network: ^Network($T), t: ^tensor.Tensor(T), limit: f64) {
 _append_layer :: proc(network: ^Network($T), layer: Layer(T)) -> Error {
 	layer := layer
 	if _, alloc_err := append(&network.layers, layer); alloc_err != nil {
-		tensor.release(&layer.weights)
-		tensor.release(&layer.bias)
+		_release_layer(&layer)
 		return .Allocation_Failed
 	}
 	if network.input_shape.rank == 0 {
@@ -203,14 +217,21 @@ _append_layer :: proc(network: ^Network($T), layer: Layer(T)) -> Error {
 	return nil
 }
 
+_release_layer :: proc(layer: ^Layer($T)) {
+	tensor.release(&layer.weights)
+	tensor.release(&layer.bias)
+	tensor.release(&layer.running_mean)
+	tensor.release(&layer.running_variance)
+}
+
 // _layer_parameters lists layer's trainable tensors in the order the trainer
 // records and updates them, using buffer for storage.
 _layer_parameters :: proc(layer: ^Layer($T), buffer: ^[2]^tensor.Tensor(T)) -> []^tensor.Tensor(T) {
 	switch layer.kind {
-	case .Dense, .Conv2D:
+	case .Dense, .Conv2D, .Batch_Norm:
 		buffer^ = {&layer.weights, &layer.bias}
 		return buffer[:]
-	case .Max_Pool2D, .Flatten:
+	case .Max_Pool2D, .Flatten, .Dropout:
 	}
 	return nil
 }

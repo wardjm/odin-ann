@@ -19,7 +19,10 @@ import "core:os"
 //         Conv2D      u32 input_channels, output_channels, kernel_size
 //         Max_Pool2D  u32 pool_size
 //         Flatten     nothing more
-//         then, for Dense and Conv2D, the weights and bias in row-major order
+//         Dropout     f64 rate
+//         Batch_Norm  u32 features, f64 momentum, f64 epsilon
+//         then the weights, bias, running mean and running variance that the
+//         layer has, each in row-major order
 //
 // Layer_Kind and Activation are stored by value, so new members go at the end
 // of each enum. Optimizer state, such as Adam's moments, is not saved.
@@ -47,7 +50,7 @@ load :: proc($T: typeid, path: string, seed: u64 = 0, allocator := context.alloc
 marshal :: proc(network: Network($T), allocator := context.allocator) -> (data: []byte, err: Error) where T == f32 || T == f64 {
 	size := len(FILE_MAGIC) + 4*(4+network.input_shape.rank)
 	for layer in network.layers {
-		size += 4*(2+_hyperparameter_count(layer.kind)) + size_of(T)*(len(layer.weights.data)+len(layer.bias.data))
+		size += 8 + _layer_settings_size(layer.kind) + size_of(T)*_layer_value_count(layer)
 	}
 	data = _make_bytes(size, allocator) or_return
 
@@ -76,9 +79,16 @@ marshal :: proc(network: Network($T), allocator := context.allocator) -> (data: 
 		case .Max_Pool2D:
 			_put_u32(&writer, layer.pool_size)
 		case .Flatten:
+		case .Dropout:
+			_put_f64(&writer, layer.rate)
+		case .Batch_Norm:
+			_put_u32(&writer, len(layer.weights.data))
+			_put_f64(&writer, layer.momentum)
+			_put_f64(&writer, layer.epsilon)
 		}
-		_put_floats(&writer, layer.weights.data)
-		_put_floats(&writer, layer.bias.data)
+		for values in _layer_values(layer) {
+			_put_floats(&writer, values)
+		}
 	}
 	assert(writer.offset == len(data))
 	return data, nil
@@ -129,42 +139,46 @@ _unmarshal_into :: proc(network: ^Network($T), data: []byte) -> Error {
 			return .Invalid_File
 		}
 		kind, activation := Layer_Kind(kind_value), Activation(activation_value)
-		if (kind == .Max_Pool2D || kind == .Flatten) && activation != .Identity {
+		if kind != .Dense && kind != .Conv2D && kind != .Batch_Norm && activation != .Identity {
 			return .Invalid_File
 		}
 
-		// Check the parameters are all there before the builder allocates
-		// them, so a corrupt size cannot request a huge allocation.
-		hyperparameters: [3]int
-		for &value in hyperparameters[:_hyperparameter_count(kind)] {
-			value = _get_u32(&reader) or_return
-		}
-		// The count is in f64 so that no u32 sizes can overflow it.
-		parameters: f64
+		// Check the values are all there before the builder allocates them,
+		// so a corrupt size cannot request a huge allocation. The count is in
+		// f64 so that no u32 sizes can overflow it.
+		build_err: Error
 		switch kind {
 		case .Dense:
-			parameters = (f64(hyperparameters[0]) + 1) * f64(hyperparameters[1])
+			inputs := _get_u32(&reader) or_return
+			outputs := _get_u32(&reader) or_return
+			_check_values_present(reader, (f64(inputs)+1)*f64(outputs), float_size) or_return
+			build_err = dense(network, inputs, outputs, activation)
 		case .Conv2D:
-			parameters = (f64(hyperparameters[2])*f64(hyperparameters[2])*f64(hyperparameters[0]) + 1) * f64(hyperparameters[1])
-		case .Max_Pool2D, .Flatten:
-		}
-		if parameters*f64(float_size) > f64(len(data)-reader.offset) {
-			return .Invalid_File
-		}
-
-		switch kind {
-		case .Dense:
-			_file_error(dense(network, hyperparameters[0], hyperparameters[1], activation)) or_return
-		case .Conv2D:
-			_file_error(conv2d(network, hyperparameters[0], hyperparameters[1], hyperparameters[2], activation)) or_return
+			input_channels := _get_u32(&reader) or_return
+			output_channels := _get_u32(&reader) or_return
+			kernel_size := _get_u32(&reader) or_return
+			_check_values_present(reader, (f64(kernel_size)*f64(kernel_size)*f64(input_channels)+1)*f64(output_channels), float_size) or_return
+			build_err = conv2d(network, input_channels, output_channels, kernel_size, activation)
 		case .Max_Pool2D:
-			_file_error(max_pool2d(network, hyperparameters[0])) or_return
+			build_err = max_pool2d(network, _get_u32(&reader) or_return)
 		case .Flatten:
-			_file_error(flatten(network)) or_return
+			build_err = flatten(network)
+		case .Dropout:
+			build_err = dropout(network, _get_f64(&reader) or_return)
+		case .Batch_Norm:
+			features := _get_u32(&reader) or_return
+			momentum := _get_f64(&reader) or_return
+			epsilon := _get_f64(&reader) or_return
+			_check_values_present(reader, 4*f64(features), float_size) or_return
+			build_err = batch_norm(network, activation, momentum, epsilon)
+			if build_err == nil && len(network.layers[len(network.layers)-1].weights.data) != features {
+				return .Invalid_File
+			}
 		}
-		layer := &network.layers[len(network.layers)-1]
-		_get_floats(&reader, layer.weights.data, float_size)
-		_get_floats(&reader, layer.bias.data, float_size)
+		_file_error(build_err) or_return
+		for stored in _layer_values(network.layers[len(network.layers)-1]) {
+			_get_floats(&reader, stored, float_size)
+		}
 	}
 	if reader.offset != len(data) {
 		return .Invalid_File
@@ -200,16 +214,41 @@ _make_bytes :: proc(size: int, allocator: runtime.Allocator) -> ([]byte, Error) 
 	return data, nil
 }
 
-// _hyperparameter_count is the number of u32 values that follow a layer's
-// kind and activation.
-_hyperparameter_count :: proc(kind: Layer_Kind) -> int {
+// _layer_settings_size is the number of bytes between a layer's activation
+// and its values.
+_layer_settings_size :: proc(kind: Layer_Kind) -> int {
 	switch kind {
-	case .Dense:      return 2
-	case .Conv2D:     return 3
-	case .Max_Pool2D: return 1
+	case .Dense:      return 8
+	case .Conv2D:     return 12
+	case .Max_Pool2D: return 4
 	case .Flatten:    return 0
+	case .Dropout:    return 8
+	case .Batch_Norm: return 20
 	}
 	return 0
+}
+
+// _layer_values lists the stored tensors' elements in file order. Tensors a
+// layer kind does not use are empty.
+_layer_values :: proc(layer: Layer($T)) -> [4][]T {
+	return {layer.weights.data, layer.bias.data, layer.running_mean.data, layer.running_variance.data}
+}
+
+_layer_value_count :: proc(layer: Layer($T)) -> int {
+	count := 0
+	for values in _layer_values(layer) {
+		count += len(values)
+	}
+	return count
+}
+
+// _check_values_present returns Invalid_File unless count values of
+// float_size bytes remain after the reader.
+_check_values_present :: proc(reader: _Cursor, count: f64, float_size: int) -> Error {
+	if count*f64(float_size) > f64(len(reader.data)-reader.offset) {
+		return .Invalid_File
+	}
+	return nil
 }
 
 // _file_error reports a layer the builders reject as Invalid_File, keeping
@@ -231,6 +270,11 @@ _put_u32 :: proc(writer: ^_Cursor, value: int) {
 	writer.offset += 4
 }
 
+_put_f64 :: proc(writer: ^_Cursor, value: f64) {
+	endian.put_f64(writer.data[writer.offset:], .Little, value)
+	writer.offset += 8
+}
+
 _put_floats :: proc(writer: ^_Cursor, values: []$T) {
 	for value in values {
 		when T == f32 {
@@ -249,6 +293,15 @@ _get_u32 :: proc(reader: ^_Cursor) -> (int, Error) {
 	}
 	reader.offset += 4
 	return int(value), nil
+}
+
+_get_f64 :: proc(reader: ^_Cursor) -> (f64, Error) {
+	value, ok := endian.get_f64(reader.data[reader.offset:], .Little)
+	if !ok {
+		return 0, .Invalid_File
+	}
+	reader.offset += 8
+	return value, nil
 }
 
 // _get_floats fills values from float_size-byte floats. The caller has

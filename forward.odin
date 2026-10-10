@@ -52,6 +52,10 @@ _layer_forward :: proc(layer: Layer($T), input: tensor.Tensor_View(T), allocator
 		return _max_pool2d_forward(layer, input, allocator)
 	case .Flatten:
 		return _flatten_forward(layer, input, allocator)
+	case .Dropout:
+		return _dropout_forward(input, allocator)
+	case .Batch_Norm:
+		return _batch_norm_forward(layer, input, allocator)
 	}
 	return output, nil
 }
