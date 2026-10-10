@@ -6,4 +6,8 @@
 /examples/*/sine
 /examples/*/spirals
 /examples/*/xor
+/examples/*/mnist
+
+# Downloaded datasets (scripts/fetch_mnist.sh)
+/data/
 __pycache__/
