@@ -97,9 +97,9 @@ Every fallible procedure returns `ann.Error`, a `#shared_nil` union of `tensor.T
 ### Networks
 
 - `new_network(T, seed = 0, allocator)` creates an empty `Network(T)` for a float type `T`. `release(&network)` frees it. Treat networks as move-only.
-- `dense(&network, inputs, outputs, activation = .Identity)` appends a layer and returns `.Shape_Mismatch` unless `inputs` equals the previous layer's output width. Each `Layer(T)` holds `weights` `[inputs, outputs]`, `bias` `[outputs]` and `activation`. These are ordinary tensors, so you can set or load them directly.
-- `input_features_of`, `output_features_of`, `parameter_count`, and `print_summary` describe a network.
-- `forward(network, input, allocator)` and `forward_views` return a new tensor owned by the caller. Each layer allocates one tensor and applies its bias and activation in place.
+- `dense(&network, inputs, outputs, activation = .Identity)` appends a layer and returns `.Shape_Mismatch` unless the previous layer's output is `[inputs]`. Each `Layer(T)` holds its `kind` (`.Dense`), `weights` `[inputs, outputs]`, `bias` `[outputs]`, `activation`, and `output_shape`, the shape of one sample after the layer. The network's `input_shape` is set by its first layer. The parameters are ordinary tensors, so you can set or load them directly.
+- `input_features_of` and `output_features_of` give the last axis of one input or output sample. `parameter_count` and `print_summary` describe a network.
+- `forward(network, input, allocator)` and `forward_views` return a new tensor owned by the caller. The input's trailing axes must match the network's `input_shape`; any leading axes are batch axes. Each dense layer allocates one tensor and applies its bias and activation in place.
 - `activate_in_place` and `softmax_in_place` apply an activation to any tensor. Softmax normalizes over the last axis and subtracts the row maximum first.
 
 ### Losses

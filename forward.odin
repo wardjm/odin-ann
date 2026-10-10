@@ -16,8 +16,7 @@ forward_views :: proc(network: Network($T), input: tensor.Tensor_View(T), alloca
 }
 
 // _forward runs every layer, skipping the last activation when
-// skip_last_activation is set so fused losses can work from logits. Each layer
-// allocates one tensor; the bias and activation are applied in place.
+// skip_last_activation is set so fused losses can work from logits.
 _forward :: proc(network: Network($T), input: tensor.Tensor_View(T), skip_last_activation: bool, allocator := context.allocator) -> (output: tensor.Tensor(T), err: Error) where intrinsics.type_is_float(T) {
 	_check_input(network, input.shape) or_return
 	defer if err != nil {
@@ -25,14 +24,27 @@ _forward :: proc(network: Network($T), input: tensor.Tensor_View(T), skip_last_a
 	}
 	current := input
 	for layer, i in network.layers {
-		product := tensor.matmul_views(current, tensor.as_view(layer.weights), allocator) or_return
+		next := _layer_forward(layer, current, allocator) or_return
 		tensor.release(&output)
-		output = product
-		tensor.add_in_place(&output, layer.bias) or_return
+		output = next
 		if !(skip_last_activation && i == len(network.layers)-1) {
 			activate_in_place(&output, layer.activation, allocator) or_return
 		}
 		current = tensor.as_view(output)
+	}
+	return output, nil
+}
+
+// _layer_forward computes one layer before its activation, as a new tensor.
+// A dense layer allocates one tensor and adds its bias in place.
+_layer_forward :: proc(layer: Layer($T), input: tensor.Tensor_View(T), allocator := context.allocator) -> (output: tensor.Tensor(T), err: Error) where intrinsics.type_is_float(T) {
+	switch layer.kind {
+	case .Dense:
+		output = tensor.matmul_views(input, tensor.as_view(layer.weights), allocator) or_return
+		if add_err := tensor.add_in_place(&output, layer.bias); add_err != .None {
+			tensor.release(&output)
+			return output, add_err
+		}
 	}
 	return output, nil
 }

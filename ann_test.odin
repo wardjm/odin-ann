@@ -78,9 +78,24 @@ test_dense_validates_layers_and_inputs :: proc(t: ^testing.T) {
 	testing.expect_value(t, parameter_count(network), 2*3+3+3*1+1)
 	testing.expect_value(t, input_features_of(network), 2)
 	testing.expect_value(t, output_features_of(network), 1)
+	expect_shape(t, _sample_dims(&network.input_shape), []int{2})
+	expect_shape(t, _sample_dims(&network.layers[0].output_shape), []int{3})
+	expect_shape(t, _sample_dims(&network.layers[1].output_shape), []int{1})
+	testing.expect_value(t, _parameter_tensor_count(&network), 4)
 
 	_, mismatch_err := forward(network, input)
 	expect_error(t, mismatch_err, Tensor_Error.Shape_Mismatch)
+	scalar, scalar_err := tensor.new_tensor(f32, []int{})
+	require_ok(t, scalar_err)
+	defer tensor.release(&scalar)
+	_, scalar_forward_err := forward(network, scalar)
+	expect_error(t, scalar_forward_err, Tensor_Error.Invalid_Shape)
+}
+
+@(test)
+test_format_shape_joins_dims :: proc(t: ^testing.T) {
+	testing.expect_value(t, _format_shape([]int{4}), "4")
+	testing.expect_value(t, _format_shape([]int{28, 28, 1}), "28x28x1")
 }
 
 @(test)
@@ -134,10 +149,12 @@ check_gradients :: proc(t: ^testing.T, network: ^Network(f64), loss: Loss, input
 	require_ok(t, backward_err, loc)
 
 	step :: 1e-6
+	slot := 0
 	for &layer, i in network.layers {
-		parameters := [2]^tensor.Tensor(f64){&layer.weights, &layer.bias}
-		for parameter, slot in parameters {
-			gradient, gradient_err := tensor.tape_gradient(&trainer.tape, trainer.parameters[2*i+slot])
+		buffer: [2]^tensor.Tensor(f64)
+		for parameter in _layer_parameters(&layer, &buffer) {
+			defer slot += 1
+			gradient, gradient_err := tensor.tape_gradient(&trainer.tape, trainer.parameters[slot])
 			require_ok(t, gradient_err, loc)
 			for j in 0..<len(parameter.data) {
 				saved := parameter.data[j]

@@ -43,8 +43,8 @@ Trainer :: struct($T: typeid) {
 	optimizer:     Optimizer,
 	steps:         int,
 	tape:          tensor.Tape(T),
-	// parameters holds each layer's weight and bias leaf on the current tape,
-	// in layer order.
+	// parameters holds every trainable tensor's leaf on the current tape, in
+	// layer order and _layer_parameters order within a layer.
 	parameters:    [dynamic]tensor.Tape_Value(T),
 	// first_moment is the SGD velocity or Adam's mean; second_moment is
 	// Adam's uncentered variance. Both are allocated on the first step.
@@ -139,21 +139,34 @@ _backward :: proc(trainer: ^Trainer($T), network: Network(T), inputs, targets: t
 	return loss, nil
 }
 
-// _record_forward records each layer as matmul, bias add and activation.
-// Parameters are borrowed leaves, appended to parameters in layer order.
+// _record_forward records every layer and its activation. Parameters are
+// borrowed leaves, appended to parameters in _layer_parameters order.
 _record_forward :: proc(tape: ^tensor.Tape($T), network: Network(T), input: tensor.Tape_Value(T), parameters: ^[dynamic]tensor.Tape_Value(T), skip_last_activation: bool) -> (output: tensor.Tape_Value(T), err: Error) where intrinsics.type_is_float(T) {
 	output = input
-	for layer, i in network.layers {
-		weights := tensor.tape_add_leaf_view(tape, tensor.as_view(layer.weights)) or_return
-		bias := tensor.tape_add_leaf_view(tape, tensor.as_view(layer.bias)) or_return
-		if _, alloc_err := append(parameters, weights, bias); alloc_err != nil {
-			return output, .Allocation_Failed
+	for &layer, i in network.layers {
+		buffer: [2]^tensor.Tensor(T)
+		first := len(parameters)
+		for parameter in _layer_parameters(&layer, &buffer) {
+			leaf := tensor.tape_add_leaf_view(tape, tensor.as_view(parameter^)) or_return
+			if _, alloc_err := append(parameters, leaf); alloc_err != nil {
+				return output, .Allocation_Failed
+			}
 		}
-		product := tensor.tape_matmul(tape, output, weights) or_return
-		output = tensor.tape_add(tape, product, bias) or_return
+		output = _record_layer(tape, layer, output, parameters[first:]) or_return
 		if !(skip_last_activation && i == len(network.layers)-1) {
 			output = _record_activation(tape, output, layer.activation) or_return
 		}
+	}
+	return output, nil
+}
+
+// _record_layer records one layer before its activation. parameters are the
+// layer's leaves on tape, in _layer_parameters order.
+_record_layer :: proc(tape: ^tensor.Tape($T), layer: Layer(T), input: tensor.Tape_Value(T), parameters: []tensor.Tape_Value(T)) -> (output: tensor.Tape_Value(T), err: Error) where intrinsics.type_is_float(T) {
+	switch layer.kind {
+	case .Dense:
+		product := tensor.tape_matmul(tape, input, parameters[0]) or_return
+		output = tensor.tape_add(tape, product, parameters[1]) or_return
 	}
 	return output, nil
 }
@@ -187,14 +200,18 @@ _record_activation :: proc(tape: ^tensor.Tape($T), x: tensor.Tape_Value(T), acti
 // on the tape. The tape borrows the parameters, but nothing reads them again
 // before the next step resets it.
 _apply_optimizer :: proc(trainer: ^Trainer($T), network: ^Network(T)) -> Error where intrinsics.type_is_float(T) {
-	if len(trainer.parameters) != 2*len(network.layers) {
+	if len(trainer.parameters) != _parameter_tensor_count(network) {
 		return .Network_Changed
 	}
-	_ensure_optimizer_state(trainer, network^) or_return
+	_ensure_optimizer_state(trainer, network) or_return
 	trainer.steps += 1
-	for &layer, i in network.layers {
-		_update_parameter(trainer, &layer.weights, 2*i) or_return
-		_update_parameter(trainer, &layer.bias, 2*i+1) or_return
+	slot := 0
+	for &layer in network.layers {
+		buffer: [2]^tensor.Tensor(T)
+		for parameter in _layer_parameters(&layer, &buffer) {
+			_update_parameter(trainer, parameter, slot) or_return
+			slot += 1
+		}
 	}
 	return nil
 }
@@ -243,8 +260,9 @@ _update_parameter :: proc(trainer: ^Trainer($T), parameter: ^tensor.Tensor(T), s
 }
 
 // _ensure_optimizer_state allocates zeroed moment buffers on the first step
-// and afterwards checks they still match the network's parameters.
-_ensure_optimizer_state :: proc(trainer: ^Trainer($T), network: Network(T)) -> Error where intrinsics.type_is_float(T) {
+// and afterwards checks they still match the network's parameters, slot by
+// slot in _layer_parameters order.
+_ensure_optimizer_state :: proc(trainer: ^Trainer($T), network: ^Network(T)) -> Error where intrinsics.type_is_float(T) {
 	moments := 0
 	switch optimizer in trainer.optimizer {
 	case SGD:
@@ -258,12 +276,17 @@ _ensure_optimizer_state :: proc(trainer: ^Trainer($T), network: Network(T)) -> E
 		return nil
 	}
 	if len(trainer.first_moment) > 0 {
-		if len(trainer.first_moment) != 2*len(network.layers) {
+		if len(trainer.first_moment) != _parameter_tensor_count(network) {
 			return .Network_Changed
 		}
-		for layer, i in network.layers {
-			if !_same_shape(trainer.first_moment[2*i].shape, layer.weights.shape) || !_same_shape(trainer.first_moment[2*i+1].shape, layer.bias.shape) {
-				return .Network_Changed
+		slot := 0
+		for &layer in network.layers {
+			buffer: [2]^tensor.Tensor(T)
+			for parameter in _layer_parameters(&layer, &buffer) {
+				if !_same_shape(trainer.first_moment[slot].shape, parameter.shape) {
+					return .Network_Changed
+				}
+				slot += 1
 			}
 		}
 		return nil
@@ -276,9 +299,11 @@ _ensure_optimizer_state :: proc(trainer: ^Trainer($T), network: Network(T)) -> E
 	return err
 }
 
-_allocate_moments :: proc(trainer: ^Trainer($T), network: Network(T), moments: int) -> Error where intrinsics.type_is_float(T) {
-	for layer in network.layers {
-		for shape in ([2][]int{layer.weights.shape, layer.bias.shape}) {
+_allocate_moments :: proc(trainer: ^Trainer($T), network: ^Network(T), moments: int) -> Error where intrinsics.type_is_float(T) {
+	for &layer in network.layers {
+		buffer: [2]^tensor.Tensor(T)
+		for parameter in _layer_parameters(&layer, &buffer) {
+			shape := parameter.shape
 			first := tensor.new_tensor(T, shape, trainer.allocator) or_return
 			if _, alloc_err := append(&trainer.first_moment, first); alloc_err != nil {
 				tensor.release(&first)
