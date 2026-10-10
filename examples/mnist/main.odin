@@ -4,9 +4,11 @@
 //
 //     scripts/fetch_mnist.sh
 //     odin run examples/mnist -o:speed
-//     odin run examples/mnist -o:speed -- path/to/mnist 5
+//     odin run examples/mnist -o:speed -- path/to/mnist 5 4
 //
-// The optional arguments are the data directory and the number of epochs.
+// The optional arguments are the data directory, the number of epochs and the
+// number of threads, which defaults to the physical core count. The results
+// are the same for any thread count.
 package mnist
 
 import "core:bytes"
@@ -15,6 +17,7 @@ import "core:encoding/endian"
 import "core:fmt"
 import "core:os"
 import "core:strconv"
+import "core:sys/info"
 import "core:time"
 import ann "../.."
 import tensor "../../../odin-tensor"
@@ -45,6 +48,19 @@ main :: proc() {
 			return
 		}
 	}
+	threads, _, _ := info.cpu_core_count()
+	if len(os.args) > 3 {
+		ok: bool
+		if threads, ok = strconv.parse_int(os.args[3]); !ok || threads <= 0 {
+			fmt.eprintln("threads must be a positive integer, got", os.args[3])
+			return
+		}
+	}
+	if err := tensor.set_thread_count(max(threads, 1)); err != .None {
+		fmt.eprintln("threads:", err)
+		return
+	}
+	defer tensor.set_thread_count(1)
 
 	train, train_ok := load_dataset(dir, "train")
 	if !train_ok do return
@@ -58,7 +74,7 @@ main :: proc() {
 		return
 	}
 	defer tensor.release(&targets)
-	fmt.printf("%d training and %d test images\n\n", len(train.labels), len(test.labels))
+	fmt.printf("%d training and %d test images, %d threads\n\n", len(train.labels), len(test.labels), tensor.thread_count())
 
 	// 28x28x1 -> 24x24x8 -> 12x12x8 -> 8x8x16 -> 4x4x16 -> 256 -> 10
 	network := ann.new_network(f32, seed = 1)

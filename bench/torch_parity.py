@@ -11,8 +11,8 @@ them to a scratch directory, and runs bench/torch_parity (built with
 -o:speed). It runs the same network in PyTorch, treated as ground truth, and
 compares the forward output, the loss of every training step and the final
 parameters. It then compares the median time of one forward pass and one
-train_step. PyTorch runs on the CPU with one thread, because odin-tensor is
-single-threaded; pass --threads N to change that.
+train_step. Both run on the CPU with one thread by default; --threads N gives
+each N threads.
 """
 
 import argparse
@@ -141,8 +141,8 @@ def make_data(case, rng):
     return parameters, x, y
 
 
-def write_case(case, directory, parameters, x, y):
-    lines = [f"dtype {case.dtype}"]
+def write_case(case, directory, parameters, x, y, threads):
+    lines = [f"dtype {case.dtype}", f"threads {threads}"]
     if case.layers[0][0] != "dense":
         lines.append("input " + " ".join(map(str, case.input_shape)))
     lines += [" ".join(map(str, layer)) for layer in case.layers]
@@ -267,7 +267,7 @@ def relative_error(odin, reference):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("filters", nargs="*", help="run only cases whose name contains one of these")
-    parser.add_argument("--threads", type=int, default=1, help="PyTorch CPU threads (default 1)")
+    parser.add_argument("--threads", type=int, default=1, help="CPU threads for both odin-tensor and PyTorch (default 1)")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
@@ -282,7 +282,7 @@ def main():
         subprocess.run(["odin", "build", str(ROOT / "bench" / "torch_parity"), "-o:speed",
                         f"-out:{binary}"], check=True, cwd=ROOT)
 
-        print(f"torch {torch.__version__}, {args.threads} CPU thread(s); errors are max|odin - torch| / max|torch|\n")
+        print(f"torch {torch.__version__}, {args.threads} CPU thread(s) each; errors are max|odin - torch| / max|torch|\n")
         header = f"{'case':<20} {'forward':>9} {'losses':>9} {'params':>9} {'':>4}  " \
                  f"{'fwd odin':>9} {'torch':>9} {'step odin':>10} {'torch':>9}"
         print(header)
@@ -293,7 +293,7 @@ def main():
             directory = scratch / case.name
             directory.mkdir()
             parameters, x, y = make_data(case, rng)
-            write_case(case, directory, parameters, x, y)
+            write_case(case, directory, parameters, x, y, args.threads)
 
             o_forward, o_losses, o_final, o_time = run_odin(case, binary, directory, parameters)
             t_forward, t_losses, t_final, t_time = run_torch(case, parameters, x, y)

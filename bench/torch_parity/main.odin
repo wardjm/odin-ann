@@ -27,6 +27,7 @@ import tensor "../../../odin-tensor"
 
 Spec :: struct {
 	dtype:       string,
+	threads:     int,
 	// input_shape is one sample's shape; the first layer's input if empty.
 	input_shape: [dynamic]int,
 	layers:      [dynamic]Layer_Spec,
@@ -57,6 +58,13 @@ main :: proc() {
 	if !ok {
 		os.exit(2)
 	}
+	if spec.threads > 1 {
+		if err := tensor.set_thread_count(spec.threads); err != .None {
+			fmt.eprintln("threads:", err)
+			os.exit(2)
+		}
+	}
+	defer tensor.set_thread_count(1)
 	err: ann.Error
 	switch spec.dtype {
 	case "f32":
@@ -188,6 +196,8 @@ parse_spec :: proc(dir: string) -> (spec: Spec, ok: bool) {
 		switch f[0] {
 		case "dtype":
 			spec.dtype = f[1]
+		case "threads":
+			spec.threads = atoi(f[1])
 		case "input":
 			for field in f[1:] {
 				append(&spec.input_shape, atoi(field))

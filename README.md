@@ -88,7 +88,7 @@ Run these from the repository root:
 | `odin run examples/xor` | Binary cross-entropy, Adam, `print_summary`, and early stopping from the `on_epoch` callback. |
 | `odin run examples/sine -o:speed` | Regression with shuffled minibatches and a learning-rate schedule set from the callback, plotted as text. |
 | `odin run examples/spirals -o:speed` | Three-class softmax cross-entropy, `one_hot`, `accuracy`, and a decision map from one batched `predict_classes` call. |
-| `odin run examples/mnist -o:speed` | A convolutional network (`conv2d`, `max_pool2d`, `flatten`) on the MNIST digits, with test accuracy from `on_epoch` after each epoch. Run `scripts/fetch_mnist.sh` first to download the data, about 11 MB, into `data/mnist`. Three epochs take under 40 seconds on one core and reach about 98.6% test accuracy. |
+| `odin run examples/mnist -o:speed` | A convolutional network (`conv2d`, `max_pool2d`, `flatten`) on the MNIST digits, with test accuracy from `on_epoch` after each epoch. Run `scripts/fetch_mnist.sh` first to download the data, about 11 MB, into `data/mnist`. Three epochs reach about 98.6% test accuracy, in about 30 seconds on 8 cores or 40 on one. It uses every physical core unless a third argument, after the data directory and epoch count, sets the thread count. |
 
 ## API
 
@@ -129,6 +129,7 @@ loss, step_err := ann.train_step(&trainer, &network, inputs, targets)
 - `sgd(learning_rate, momentum = 0, weight_decay = 0)` and `adam(learning_rate = 0.001, beta1 = 0.9, beta2 = 0.999, epsilon = 1e-8, weight_decay = 0)` build an `Optimizer`, a union of the `SGD` and `Adam` structs. Weight decay is decoupled: each step scales parameters by `1 - learning_rate*weight_decay`. Out-of-range values return `.Invalid_Hyperparameter` from `trainer_init`.
 - A `Trainer(T)` owns one autodiff tape, which it resets and rebuilds every step, and the optimizer's moment buffers, which it creates on the first step. You pass the network to each call instead of storing it in the trainer, so the network can move freely. If you add or reshape layers afterwards, `train_step` returns `.Network_Changed`.
 - `train_step(&trainer, &network, inputs, targets)` runs forward, backward and one optimizer update. Its result is the loss from before the update. `train_step_views` takes borrowed views. `trainer.steps` counts updates, and `set_learning_rate` changes the step size without resetting the moment buffers.
+- Training and inference run on one thread unless you call odin-tensor's `tensor.set_thread_count(n)`. Large matrix products are then split across `n` threads, with identical results. Dense layers with hundreds of units or more gain the most: a 1024-1024-1024 MLP trains about 4× faster on 8 cores. The MNIST CNN gains about 20%, because most of its time goes on single-threaded work.
 - `fit(&trainer, &network, inputs, targets, options)` trains over a dataset whose first axis indexes samples and returns the mean loss of the last epoch. `Fit_Options` sets `epochs`, `batch_size` (0 means the whole dataset), and `shuffle` with `seed`. It also takes `on_epoch(epoch, loss, user_data) -> bool`, which runs after each epoch; returning false stops early. In-order batches are zero-copy `slice_view`s of the dataset. Shuffled batches are copied into two reused buffers.
 
 ### Metrics
