@@ -107,50 +107,36 @@ flatten :: proc(network: ^Network($T)) -> Error where intrinsics.type_is_float(T
 	return _append_layer(network, Layer(T){kind = .Flatten, input_shape = input_shape, output_shape = _sample_shape(features)})
 }
 
-// _conv2d_shapes writes the shapes a convolution of input_shape works in:
-// the windows merged into [positions, kernel²·input_channels] rows, and the
-// output with input's batch axes.
-_conv2d_shapes :: proc(layer: Layer($T), input_shape: []int, rows_buffer: ^[2]int, output_buffer: []int) -> (rows, output: []int) {
-	columns := len(layer.weights.data) / layer.weights.shape[3]
-	rows_buffer^ = {-1, columns}
-	return rows_buffer[:], _image_output_shape(layer, input_shape, output_buffer)
+// _conv2d_kernels views a Conv2D layer's [kernel, kernel, input_channels,
+// output_channels] weights as the [kernel²·input_channels, output_channels]
+// matrix that im2col's windows multiply, writing its shape and strides into
+// the buffers.
+_conv2d_kernels :: proc(layer: Layer($T), shape, strides: ^[2]int) -> tensor.Tensor_View(T) {
+	outputs := layer.weights.shape[3]
+	shape^ = {len(layer.weights.data) / outputs, outputs}
+	strides^ = {outputs, 1}
+	return tensor.Tensor_View(T){data = layer.weights.data, shape = shape[:], strides = strides[:]}
 }
 
-// _conv2d_forward computes a Conv2D layer's output before its activation.
+// _conv2d_forward computes a Conv2D layer's output before its activation:
+// im2col's [..., out_h, out_w, kernel²·input_channels] windows times the
+// kernels, plus the bias, which tensor.linear applies to the last axis.
 _conv2d_forward :: proc(layer: Layer($T), input: tensor.Tensor_View(T), allocator := context.allocator) -> (output: tensor.Tensor(T), err: Error) where intrinsics.type_is_float(T) {
 	kernel_size := layer.weights.shape[0]
 	windows := tensor.im2col_views(input, kernel_size, kernel_size, layer.stride, layer.padding, allocator) or_return
 	defer tensor.release(&windows)
-	rows_buffer: [2]int
-	output_buffer: [tensor.MAX_RANK]int
-	rows, output_shape := _conv2d_shapes(layer, input.shape, &rows_buffer, output_buffer[:])
-	tensor.reshape(&windows, rows) or_return
-
-	kernel_shape := [2]int{rows[1], layer.weights.shape[3]}
-	kernel_strides := [2]int{layer.weights.shape[3], 1}
-	kernels := tensor.Tensor_View(T){data = layer.weights.data, shape = kernel_shape[:], strides = kernel_strides[:]}
-	output = tensor.linear_views(tensor.as_view(windows), kernels, tensor.as_view(layer.bias), allocator) or_return
-	defer if err != nil {
-		tensor.release(&output)
-	}
-	tensor.reshape(&output, output_shape) or_return
-	return output, nil
+	kernel_shape, kernel_strides: [2]int
+	kernels := _conv2d_kernels(layer, &kernel_shape, &kernel_strides)
+	return tensor.linear_views(tensor.as_view(windows), kernels, tensor.as_view(layer.bias), allocator)
 }
 
 // _record_conv2d records a Conv2D layer before its activation, computing it
 // exactly as _conv2d_forward does.
 _record_conv2d :: proc(tape: ^tensor.Tape($T), layer: Layer(T), input, weights, bias: tensor.Tape_Value(T)) -> (output: tensor.Tape_Value(T), err: Error) where intrinsics.type_is_float(T) {
 	kernel_size := layer.weights.shape[0]
-	value := tensor.tape_value(tape, input) or_return
-	rows_buffer: [2]int
-	output_buffer: [tensor.MAX_RANK]int
-	rows, output_shape := _conv2d_shapes(layer, value.shape, &rows_buffer, output_buffer[:])
-
 	windows := tensor.tape_im2col(tape, input, kernel_size, kernel_size, layer.stride, layer.padding) or_return
-	windows = tensor.tape_reshape(tape, windows, rows) or_return
-	kernels := tensor.tape_reshape(tape, weights, []int{rows[1], -1}) or_return
-	output = tensor.tape_linear(tape, windows, kernels, bias) or_return
-	return tensor.tape_reshape(tape, output, output_shape)
+	kernels := tensor.tape_reshape(tape, weights, []int{len(layer.weights.data) / layer.weights.shape[3], -1}) or_return
+	return tensor.tape_linear(tape, windows, kernels, bias)
 }
 
 _max_pool2d_forward :: proc(layer: Layer($T), input: tensor.Tensor_View(T), allocator := context.allocator) -> (output: tensor.Tensor(T), err: Error) where intrinsics.type_is_float(T) {

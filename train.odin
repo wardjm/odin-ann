@@ -185,15 +185,7 @@ _record_forward :: proc(tape: ^tensor.Tape($T), network: Network(T), input: tens
 _record_layer :: proc(tape: ^tensor.Tape($T), layer: Layer(T), input: tensor.Tape_Value(T), parameters: []tensor.Tape_Value(T), training: _Training, fuse_relu := false) -> (output: tensor.Tape_Value(T), err: Error) where intrinsics.type_is_float(T) {
 	switch layer.kind {
 	case .Dense:
-		// As in _layer_forward: a batch of vectors takes the fused affine map,
-		// other ranks a broadcast product and addition.
-		value := tensor.tape_value(tape, input) or_return
-		if len(value.shape) == 2 {
-			output = tensor.tape_linear(tape, input, parameters[0], parameters[1]) or_return
-		} else {
-			product := tensor.tape_matmul(tape, input, parameters[0]) or_return
-			output = tensor.tape_add(tape, product, parameters[1]) or_return
-		}
+		output = tensor.tape_linear(tape, input, parameters[0], parameters[1]) or_return
 	case .Conv2D:
 		output = _record_conv2d(tape, layer, input, parameters[0], parameters[1]) or_return
 	case .Max_Pool2D:
