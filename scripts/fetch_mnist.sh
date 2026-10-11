@@ -19,17 +19,28 @@ files=(
 	"t10k-labels-idx1-ubyte.gz ec29112dd5afa0611ce80d1b7f02629c"
 )
 
+# md5_matches FILE SUM succeeds if FILE exists and has MD5 sum SUM. It uses
+# md5sum where present, and macOS's md5 otherwise.
+md5_matches() {
+	[ -f "$1" ] || return 1
+	if command -v md5sum > /dev/null; then
+		echo "$2  $1" | md5sum --check --status
+	else
+		[ "$(md5 -q "$1")" = "$2" ]
+	fi
+}
+
 mkdir -p "$dir"
 for entry in "${files[@]}"; do
 	read -r name md5 <<< "$entry"
 	path="$dir/$name"
-	if [ -f "$path" ] && echo "$md5  $path" | md5sum --check --status; then
+	if md5_matches "$path" "$md5"; then
 		echo "have $name"
 		continue
 	fi
 	echo "fetching $name"
 	curl --fail --silent --show-error --location --output "$path.part" "$base_url/$name"
-	if ! echo "$md5  $path.part" | md5sum --check --status; then
+	if ! md5_matches "$path.part" "$md5"; then
 		rm -f "$path.part"
 		echo "checksum mismatch for $name" >&2
 		exit 1
