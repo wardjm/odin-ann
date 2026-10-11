@@ -9,6 +9,7 @@
 /examples/*/mnist
 /examples/*/mnist_deep
 /examples/*/mnist_denoise
+/examples/*/cifar10
 
 # Downloaded datasets (scripts/fetch_mnist.sh)
 /data/
