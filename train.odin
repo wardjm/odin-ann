@@ -168,17 +168,21 @@ _record_forward :: proc(tape: ^tensor.Tape($T), network: Network(T), input: tens
 				return output, .Allocation_Failed
 			}
 		}
-		output = _record_layer(tape, layer, output, parameters[first:], training) or_return
-		if !(skip_last_activation && i == len(network.layers)-1) {
+		activate := !(skip_last_activation && i == len(network.layers)-1)
+		// Batch norm applies a ReLU itself, saving that node's passes.
+		fuse_relu := activate && layer.kind == .Batch_Norm && layer.activation == .ReLU
+		output = _record_layer(tape, layer, output, parameters[first:], training, fuse_relu) or_return
+		if activate && !fuse_relu {
 			output = _record_activation(tape, output, layer.activation) or_return
 		}
 	}
 	return output, nil
 }
 
-// _record_layer records one layer before its activation. parameters are the
-// layer's leaves on tape, in _layer_parameters order.
-_record_layer :: proc(tape: ^tensor.Tape($T), layer: Layer(T), input: tensor.Tape_Value(T), parameters: []tensor.Tape_Value(T), training: _Training) -> (output: tensor.Tape_Value(T), err: Error) where intrinsics.type_is_float(T) {
+// _record_layer records one layer before its activation, or for a batch norm
+// with fuse_relu, with its ReLU. parameters are the layer's leaves on tape, in
+// _layer_parameters order.
+_record_layer :: proc(tape: ^tensor.Tape($T), layer: Layer(T), input: tensor.Tape_Value(T), parameters: []tensor.Tape_Value(T), training: _Training, fuse_relu := false) -> (output: tensor.Tape_Value(T), err: Error) where intrinsics.type_is_float(T) {
 	switch layer.kind {
 	case .Dense:
 		// As in _layer_forward: a batch of vectors takes the fused affine map,
@@ -199,7 +203,7 @@ _record_layer :: proc(tape: ^tensor.Tape($T), layer: Layer(T), input: tensor.Tap
 	case .Dropout:
 		output = _record_dropout(tape, layer, input, training) or_return
 	case .Batch_Norm:
-		output = _record_batch_norm(tape, layer, input, parameters[0], parameters[1], training) or_return
+		output = _record_batch_norm(tape, layer, input, parameters[0], parameters[1], training, fuse_relu) or_return
 	case .Upsample2D:
 		output = _record_upsample2d(tape, layer, input) or_return
 	}
