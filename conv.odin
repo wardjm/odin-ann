@@ -129,11 +129,10 @@ _conv2d_forward :: proc(layer: Layer($T), input: tensor.Tensor_View(T), allocato
 	kernel_shape := [2]int{rows[1], layer.weights.shape[3]}
 	kernel_strides := [2]int{layer.weights.shape[3], 1}
 	kernels := tensor.Tensor_View(T){data = layer.weights.data, shape = kernel_shape[:], strides = kernel_strides[:]}
-	output = tensor.matmul_views(tensor.as_view(windows), kernels, allocator) or_return
+	output = tensor.linear_views(tensor.as_view(windows), kernels, tensor.as_view(layer.bias), allocator) or_return
 	defer if err != nil {
 		tensor.release(&output)
 	}
-	tensor.add_in_place(&output, layer.bias) or_return
 	tensor.reshape(&output, output_shape) or_return
 	return output, nil
 }
@@ -150,8 +149,7 @@ _record_conv2d :: proc(tape: ^tensor.Tape($T), layer: Layer(T), input, weights, 
 	windows := tensor.tape_im2col(tape, input, kernel_size, kernel_size, layer.stride, layer.padding) or_return
 	windows = tensor.tape_reshape(tape, windows, rows) or_return
 	kernels := tensor.tape_reshape(tape, weights, []int{rows[1], -1}) or_return
-	product := tensor.tape_matmul(tape, windows, kernels) or_return
-	output = tensor.tape_add(tape, product, bias) or_return
+	output = tensor.tape_linear(tape, windows, kernels, bias) or_return
 	return tensor.tape_reshape(tape, output, output_shape)
 }
 

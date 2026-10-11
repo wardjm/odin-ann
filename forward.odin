@@ -36,11 +36,15 @@ _forward :: proc(network: Network($T), input: tensor.Tensor_View(T), skip_last_a
 }
 
 // _layer_forward computes one layer before its activation, as a new tensor.
-// A dense layer allocates one tensor and adds its bias in place. input's
-// trailing axes are the layer's input sample shape.
+// A dense layer on a batch computes tensor.linear, as training records it;
+// other ranks add the bias in place after the product. input's trailing axes
+// are the layer's input sample shape.
 _layer_forward :: proc(layer: Layer($T), input: tensor.Tensor_View(T), allocator := context.allocator) -> (output: tensor.Tensor(T), err: Error) where intrinsics.type_is_float(T) {
 	switch layer.kind {
 	case .Dense:
+		if len(input.shape) == 2 {
+			return tensor.linear_views(input, tensor.as_view(layer.weights), tensor.as_view(layer.bias), allocator)
+		}
 		output = tensor.matmul_views(input, tensor.as_view(layer.weights), allocator) or_return
 		if add_err := tensor.add_in_place(&output, layer.bias); add_err != .None {
 			tensor.release(&output)
