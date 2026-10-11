@@ -13,7 +13,11 @@ env:
 
 jobs:
   test:
-    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
     defaults:
       run:
         working-directory: odin-ann
@@ -35,13 +39,14 @@ jobs:
         uses: actions/cache@v6
         with:
           path: odin-compiler
-          key: odin-${{ env.ODIN_COMMIT }}-llvm${{ env.LLVM_VERSION }}
+          key: odin-${{ env.ODIN_COMMIT }}-ubuntu-llvm${{ env.LLVM_VERSION }}-${{ runner.os }}-${{ runner.arch }}
 
       - name: Install LLVM
         run: |
-          wget -q https://apt.llvm.org/llvm.sh
-          chmod +x llvm.sh
-          sudo ./llvm.sh "$LLVM_VERSION"
+          # Ubuntu's own LLVM packages, rather than apt.llvm.org's, whose arm64
+          # libllvm18 breaks its own llvm-18-dev.
+          sudo apt-get update
+          sudo apt-get install -y "llvm-$LLVM_VERSION-dev" "clang-$LLVM_VERSION" "lld-$LLVM_VERSION"
           echo "/usr/lib/llvm-$LLVM_VERSION/bin" >> "$GITHUB_PATH"
 
       - name: Check out Odin
