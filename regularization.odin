@@ -1,6 +1,7 @@
 package ann
 
 import "base:intrinsics"
+import "base:runtime"
 import "core:math"
 import "core:math/rand"
 import tensor "../odin-tensor"
@@ -102,49 +103,39 @@ _record_dropout :: proc(tape: ^tensor.Tape($T), layer: Layer(T), input: tensor.T
 	return tensor.tape_mul(tape, input, mask_leaf)
 }
 
-// _record_batch_norm normalizes input with its own statistics over every
-// axis but the last, viewing it as [samples, features], and updates the
-// running statistics when training asks for it.
+// _record_batch_norm records tensor.tape_batch_norm, which normalizes input
+// with its own statistics over every axis but the last and applies the scale,
+// then adds the shift. It updates the running statistics when training asks
+// for it.
 _record_batch_norm :: proc(tape: ^tensor.Tape($T), layer: Layer(T), input, scale, shift: tensor.Tape_Value(T), training: _Training) -> (output: tensor.Tape_Value(T), err: Error) where intrinsics.type_is_float(T) {
-	value := tensor.tape_value(tape, input) or_return
-	shape_buffer: [tensor.MAX_RANK]int
-	shape := shape_buffer[:len(value.shape)]
-	copy(shape, value.shape)
 	features := len(layer.weights.data)
-	samples := 1
-	for dim in shape {
-		samples *= dim
+	statistics: []T
+	if training.update_statistics {
+		alloc_err: runtime.Allocator_Error
+		if statistics, alloc_err = make([]T, 2*features, tape.allocator); alloc_err != nil {
+			return output, .Allocation_Failed
+		}
 	}
-	samples /= features
-
-	epsilon_value := tensor.from_slice(T, []T{T(layer.epsilon)}, []int{1}, tape.allocator) or_return
-	defer tensor.release(&epsilon_value)
-	epsilon := tensor.tape_add_leaf_copy(tape, tensor.as_view(epsilon_value), false) or_return
-
-	rows := tensor.tape_reshape(tape, input, []int{samples, features}) or_return
-	mean := tensor.tape_mean_axis(tape, rows, 0, keep_dims = true) or_return
-	centered := tensor.tape_sub(tape, rows, mean) or_return
-	squared := tensor.tape_mul(tape, centered, centered) or_return
-	variance := tensor.tape_mean_axis(tape, squared, 0, keep_dims = true) or_return
-	shifted_variance := tensor.tape_add(tape, variance, epsilon) or_return
-	deviation := tensor.tape_sqrt(tape, shifted_variance) or_return
-	normalized := tensor.tape_div(tape, centered, deviation) or_return
-	scaled := tensor.tape_mul(tape, normalized, scale) or_return
-	output = tensor.tape_add(tape, scaled, shift) or_return
+	defer delete(statistics, tape.allocator)
+	means, variances := statistics[:len(statistics)/2], statistics[len(statistics)/2:]
+	normalized := tensor.tape_batch_norm(tape, input, scale, T(layer.epsilon), means if training.update_statistics else nil, variances if training.update_statistics else nil) or_return
+	output = tensor.tape_add(tape, normalized, shift) or_return
 
 	if training.update_statistics {
-		mean_value := tensor.tape_value(tape, mean) or_return
-		variance_value := tensor.tape_value(tape, variance) or_return
+		value := tensor.tape_value(tape, input) or_return
+		samples := 1
+		for dim in value.shape {
+			samples *= dim
+		}
+		samples /= features
 		// The running variance is unbiased. One sample per feature has no
 		// unbiased estimate, so its biased variance, zero, is used.
 		correction := samples > 1 ? T(samples) / T(samples-1) : 1
 		momentum := T(layer.momentum)
 		for f in 0..<features {
-			batch_mean := mean_value.data[mean_value.offset+f]
-			batch_variance := variance_value.data[variance_value.offset+f] * correction
-			layer.running_mean.data[f] += momentum * (batch_mean - layer.running_mean.data[f])
-			layer.running_variance.data[f] += momentum * (batch_variance - layer.running_variance.data[f])
+			layer.running_mean.data[f] += momentum * (means[f] - layer.running_mean.data[f])
+			layer.running_variance.data[f] += momentum * (variances[f]*correction - layer.running_variance.data[f])
 		}
 	}
-	return tensor.tape_reshape(tape, output, shape)
+	return output, nil
 }
