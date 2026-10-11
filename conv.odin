@@ -13,19 +13,31 @@ import tensor "../odin-tensor"
 // im2col, product and bias add on the tape, so forward and train_step agree
 // exactly.
 
-// conv2d appends a valid, stride-1 convolution with square kernel_size
-// kernels. Its input must be [height, width, input_channels] with height and
-// width at least kernel_size, from set_input_shape or the preceding layer; the
-// output is [height-kernel_size+1, width-kernel_size+1, output_channels].
-// Weights are [kernel_size, kernel_size, input_channels, output_channels],
-// drawn like dense weights with fan-in kernel_size²·input_channels and fan-out
-// kernel_size²·output_channels; biases start at zero.
-conv2d :: proc(network: ^Network($T), input_channels, output_channels, kernel_size: int, activation := Activation.Identity) -> Error where intrinsics.type_is_float(T) {
-	if input_channels <= 0 || output_channels <= 0 || kernel_size <= 0 {
+// conv2d appends a convolution with square kernel_size kernels. The image is
+// surrounded by padding rows and columns of zeros, and the kernels move stride
+// pixels at a time, so a 3x3 kernel with padding 1 and stride 1 keeps the
+// image's size and stride 2 halves it. Its input must be [height, width,
+// input_channels] from set_input_shape or the preceding layer, with
+// height+2·padding and width+2·padding at least kernel_size; the output is
+// [(height+2·padding-kernel_size)/stride+1, likewise for width,
+// output_channels], rounding down, so windows that would pass the padded
+// image's edge are dropped. Weights are [kernel_size, kernel_size,
+// input_channels, output_channels], drawn like dense weights with fan-in
+// kernel_size²·input_channels and fan-out kernel_size²·output_channels;
+// biases start at zero.
+conv2d :: proc(network: ^Network($T), input_channels, output_channels, kernel_size: int, activation := Activation.Identity, stride := 1, padding := 0) -> Error where intrinsics.type_is_float(T) {
+	if input_channels <= 0 || output_channels <= 0 || kernel_size <= 0 || stride <= 0 || padding < 0 {
 		return .Invalid_Shape
 	}
 	input_shape := _current_shape(network^)
-	if input_shape.rank != 3 || input_shape.dims[2] != input_channels || input_shape.dims[0] < kernel_size || input_shape.dims[1] < kernel_size {
+	if input_shape.rank != 3 || input_shape.dims[2] != input_channels {
+		return .Shape_Mismatch
+	}
+	if padding > (max(int)-max(input_shape.dims[0], input_shape.dims[1]))/2 {
+		return .Invalid_Shape
+	}
+	height, width := input_shape.dims[0]+2*padding, input_shape.dims[1]+2*padding
+	if height < kernel_size || width < kernel_size {
 		return .Shape_Mismatch
 	}
 
@@ -38,8 +50,8 @@ conv2d :: proc(network: ^Network($T), input_channels, output_channels, kernel_si
 	area := kernel_size * kernel_size
 	_fill_uniform(network, &weights, _init_limit(area*input_channels, area*output_channels, activation))
 
-	output_shape := _sample_shape(input_shape.dims[0]-kernel_size+1, input_shape.dims[1]-kernel_size+1, output_channels)
-	layer := Layer(T){kind = .Conv2D, weights = weights, bias = bias, activation = activation, input_shape = input_shape, output_shape = output_shape}
+	output_shape := _sample_shape((height-kernel_size)/stride+1, (width-kernel_size)/stride+1, output_channels)
+	layer := Layer(T){kind = .Conv2D, weights = weights, bias = bias, activation = activation, stride = stride, padding = padding, input_shape = input_shape, output_shape = output_shape}
 	return _append_layer(network, layer)
 }
 
@@ -90,7 +102,7 @@ _conv2d_shapes :: proc(layer: Layer($T), input_shape: []int, rows_buffer: ^[2]in
 // _conv2d_forward computes a Conv2D layer's output before its activation.
 _conv2d_forward :: proc(layer: Layer($T), input: tensor.Tensor_View(T), allocator := context.allocator) -> (output: tensor.Tensor(T), err: Error) where intrinsics.type_is_float(T) {
 	kernel_size := layer.weights.shape[0]
-	windows := tensor.im2col_views(input, kernel_size, kernel_size, 1, allocator) or_return
+	windows := tensor.im2col_views(input, kernel_size, kernel_size, layer.stride, layer.padding, allocator) or_return
 	defer tensor.release(&windows)
 	rows_buffer: [2]int
 	output_buffer: [tensor.MAX_RANK]int
@@ -118,7 +130,7 @@ _record_conv2d :: proc(tape: ^tensor.Tape($T), layer: Layer(T), input, weights, 
 	output_buffer: [tensor.MAX_RANK]int
 	rows, output_shape := _conv2d_shapes(layer, value.shape, &rows_buffer, output_buffer[:])
 
-	windows := tensor.tape_im2col(tape, input, kernel_size, kernel_size) or_return
+	windows := tensor.tape_im2col(tape, input, kernel_size, kernel_size, layer.stride, layer.padding) or_return
 	windows = tensor.tape_reshape(tape, windows, rows) or_return
 	kernels := tensor.tape_reshape(tape, weights, []int{rows[1], -1}) or_return
 	product := tensor.tape_matmul(tape, windows, kernels) or_return

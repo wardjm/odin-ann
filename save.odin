@@ -16,7 +16,8 @@ import "core:os"
 //         kind        u32, a Layer_Kind value
 //         activation  u32, an Activation value
 //         Dense       u32 input_features, output_features
-//         Conv2D      u32 input_channels, output_channels, kernel_size
+//         Conv2D      u32 input_channels, output_channels, kernel_size,
+//                     stride, padding
 //         Max_Pool2D  u32 pool_size
 //         Flatten     nothing more
 //         Dropout     f64 rate
@@ -76,6 +77,8 @@ marshal :: proc(network: Network($T), allocator := context.allocator) -> (data: 
 			_put_u32(&writer, layer.weights.shape[2])
 			_put_u32(&writer, layer.weights.shape[3])
 			_put_u32(&writer, layer.weights.shape[0])
+			_put_u32(&writer, layer.stride)
+			_put_u32(&writer, layer.padding)
 		case .Max_Pool2D:
 			_put_u32(&writer, layer.pool_size)
 		case .Flatten:
@@ -157,8 +160,10 @@ _unmarshal_into :: proc(network: ^Network($T), data: []byte) -> Error {
 			input_channels := _get_u32(&reader) or_return
 			output_channels := _get_u32(&reader) or_return
 			kernel_size := _get_u32(&reader) or_return
+			stride := _get_u32(&reader) or_return
+			padding := _get_u32(&reader) or_return
 			_check_values_present(reader, (f64(kernel_size)*f64(kernel_size)*f64(input_channels)+1)*f64(output_channels), float_size) or_return
-			build_err = conv2d(network, input_channels, output_channels, kernel_size, activation)
+			build_err = conv2d(network, input_channels, output_channels, kernel_size, activation, stride, padding)
 		case .Max_Pool2D:
 			build_err = max_pool2d(network, _get_u32(&reader) or_return)
 		case .Flatten:
@@ -219,7 +224,7 @@ _make_bytes :: proc(size: int, allocator: runtime.Allocator) -> ([]byte, Error) 
 _layer_settings_size :: proc(kind: Layer_Kind) -> int {
 	switch kind {
 	case .Dense:      return 8
-	case .Conv2D:     return 12
+	case .Conv2D:     return 20
 	case .Max_Pool2D: return 4
 	case .Flatten:    return 0
 	case .Dropout:    return 8

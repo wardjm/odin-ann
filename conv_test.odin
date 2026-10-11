@@ -16,32 +16,45 @@ pseudo_tensor :: proc(t: ^testing.T, shape: []int, salt: f64) -> tensor.Tensor(f
 	return result
 }
 
-@(test)
-test_conv2d_matches_direct_convolution :: proc(t: ^testing.T) {
+// expect_direct_convolution checks a 3x3 convolution of two 5x4x3 images
+// against a direct sum over each window, skipping positions in the padding,
+// and returns the network, inputs and output.
+expect_direct_convolution :: proc(t: ^testing.T, stride, padding, out_height, out_width: int, loc := #caller_location) -> (Network(f64), tensor.Tensor(f64), tensor.Tensor(f64)) {
 	network := new_network(f64)
-	defer release(&network)
-	require_ok(t, set_input_shape(&network, []int{5, 4, 3}))
-	require_ok(t, conv2d(&network, 3, 2, 3))
+	require_ok(t, set_input_shape(&network, []int{5, 4, 3}), loc)
+	require_ok(t, conv2d(&network, 3, 2, 3, stride = stride, padding = padding), loc)
 	layer := network.layers[0]
+	expect_shape(t, _sample_dims(&layer.output_shape), []int{out_height, out_width, 2}, loc)
 	copy(layer.weights.data, pseudo_values(len(layer.weights.data), 0.4))
 	copy(layer.bias.data, []f64{0.25, -0.5})
 
 	inputs := pseudo_tensor(t, []int{2, 5, 4, 3}, 1)
-	defer tensor.release(&inputs)
 	output, err := forward(network, inputs)
-	require_ok(t, err)
-	defer tensor.release(&output)
-	expect_shape(t, output.shape, []int{2, 3, 2, 2})
+	require_ok(t, err, loc)
+	expect_shape(t, output.shape, []int{2, out_height, out_width, 2}, loc)
 
-	for n in 0..<2 do for y in 0..<3 do for x in 0..<2 do for o in 0..<2 {
+	for n in 0..<2 do for oy in 0..<out_height do for ox in 0..<out_width do for o in 0..<2 {
 		expected := layer.bias.data[o]
 		for dy in 0..<3 do for dx in 0..<3 do for c in 0..<3 {
-			input_value := inputs.data[((n*5 + y+dy)*4 + x+dx)*3 + c]
+			y, x := oy*stride+dy-padding, ox*stride+dx-padding
+			if y < 0 || y >= 5 || x < 0 || x >= 4 {
+				continue
+			}
+			input_value := inputs.data[((n*5 + y)*4 + x)*3 + c]
 			weight := layer.weights.data[((dy*3 + dx)*3 + c)*2 + o]
 			expected += input_value * weight
 		}
-		expect_close(t, output.data[((n*3 + y)*2 + x)*2 + o], expected, 1e-12)
+		expect_close(t, output.data[((n*out_height + oy)*out_width + ox)*2 + o], expected, 1e-12, loc)
 	}
+	return network, inputs, output
+}
+
+@(test)
+test_conv2d_matches_direct_convolution :: proc(t: ^testing.T) {
+	network, inputs, output := expect_direct_convolution(t, 1, 0, 3, 2)
+	defer release(&network)
+	defer tensor.release(&inputs)
+	defer tensor.release(&output)
 
 	// Extra leading axes are batch axes.
 	require_ok(t, tensor.reshape(&inputs, []int{1, 2, 5, 4, 3}))
@@ -52,6 +65,30 @@ test_conv2d_matches_direct_convolution :: proc(t: ^testing.T) {
 	for value, i in nested.data {
 		testing.expect_value(t, value, output.data[i])
 	}
+}
+
+@(test)
+test_conv2d_strides_and_pads :: proc(t: ^testing.T) {
+	// Padding 1 keeps the size; with stride 2 the windows start in the
+	// padding, and the last row's window is dropped.
+	cases := [?][4]int{{1, 1, 5, 4}, {2, 1, 3, 2}, {2, 0, 2, 1}, {3, 2, 3, 2}, {1, 3, 9, 8}}
+	for c in cases {
+		network, inputs, output := expect_direct_convolution(t, c[0], c[1], c[2], c[3])
+		release(&network)
+		tensor.release(&inputs)
+		tensor.release(&output)
+	}
+
+	network := new_network(f64)
+	defer release(&network)
+	require_ok(t, set_input_shape(&network, []int{4, 4, 1}))
+	expect_error(t, conv2d(&network, 1, 2, 3, stride = 0), Tensor_Error.Invalid_Shape)
+	expect_error(t, conv2d(&network, 1, 2, 3, padding = -1), Tensor_Error.Invalid_Shape)
+	expect_error(t, conv2d(&network, 1, 2, 3, padding = max(int)/2), Tensor_Error.Invalid_Shape)
+	expect_error(t, conv2d(&network, 1, 2, 7, padding = 1), Tensor_Error.Shape_Mismatch)
+	// A kernel larger than the image fits once it is padded.
+	require_ok(t, conv2d(&network, 1, 2, 6, padding = 1))
+	expect_shape(t, _sample_dims(&network.layers[0].output_shape), []int{1, 1, 2})
 }
 
 @(test)
@@ -143,15 +180,16 @@ test_image_layers_validate_shapes :: proc(t: ^testing.T) {
 }
 
 // build_image_classifier is a small network using every image layer: a 7x7
-// input leaves a remainder row and column for the pool to drop.
+// input leaves a remainder row and column for the pool to drop, and the
+// convolutions use padding and a stride.
 build_image_classifier :: proc(t: ^testing.T, seed: u64) -> Network(f64) {
 	network := new_network(f64, seed)
 	require_ok(t, set_input_shape(&network, []int{7, 7, 2}))
-	require_ok(t, conv2d(&network, 2, 3, 3, .Tanh)) // 5x5x3
-	require_ok(t, max_pool2d(&network, 2))          // 2x2x3
-	require_ok(t, conv2d(&network, 3, 2, 2, .Tanh)) // 1x1x2
+	require_ok(t, conv2d(&network, 2, 3, 3, .Tanh, padding = 1))            // 7x7x3
+	require_ok(t, max_pool2d(&network, 2))                                  // 3x3x3
+	require_ok(t, conv2d(&network, 3, 2, 2, .Tanh, stride = 2, padding = 1)) // 2x2x2
 	require_ok(t, flatten(&network))
-	require_ok(t, dense(&network, 2, 3, .Softmax))
+	require_ok(t, dense(&network, 8, 3, .Softmax))
 	for &layer in network.layers {
 		copy(layer.bias.data, pseudo_values(len(layer.bias.data), 0.3))
 	}

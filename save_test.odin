@@ -16,6 +16,8 @@ expect_same_network :: proc(t: ^testing.T, actual: Network($A), expected: Networ
 		testing.expect_value(t, layer.kind, want.kind, loc)
 		testing.expect_value(t, layer.activation, want.activation, loc)
 		testing.expect_value(t, layer.pool_size, want.pool_size, loc)
+		testing.expect_value(t, layer.stride, want.stride, loc)
+		testing.expect_value(t, layer.padding, want.padding, loc)
 		testing.expect(t, _same_sample_shape(layer.output_shape, want.output_shape), "output shapes differ", loc = loc)
 		expect_shape(t, layer.weights.shape, want.weights.shape, loc)
 		expect_shape(t, layer.bias.shape, want.bias.shape, loc)

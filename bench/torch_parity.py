@@ -31,11 +31,21 @@ ROOT = Path(__file__).resolve().parent.parent
 
 
 # Layers mirror odin-ann's builders: ("dense", inputs, outputs, activation),
-# ("conv2d", in_channels, out_channels, kernel, activation), ("max_pool2d",
-# size), ("flatten",) and ("batch_norm", features, activation). Image samples
+# ("conv2d", in_channels, out_channels, kernel, activation), optionally
+# followed by stride and padding, ("max_pool2d", size), ("flatten",) and
+# ("batch_norm", features, activation). Image samples
 # are channels-last [h, w, c], as in odin-ann; PyTorch's half converts to and
 # from its channels-first layout. Batch normalization uses odin-ann's
 # defaults, momentum 0.1 and epsilon 1e-5, which are also PyTorch's.
+
+
+def activation_of(layer):
+    return layer[4] if layer[0] == "conv2d" else layer[-1]
+
+
+def conv_geometry(layer):
+    """A conv2d layer's stride and padding."""
+    return (layer[5], layer[6]) if len(layer) > 5 else (1, 0)
 
 
 def dense_layers(sizes, activations):
@@ -73,6 +83,8 @@ ADAM = ("adam", 1e-3, 0.9, 0.999, 1e-8, 0.0)
 # examples/mnist: 28x28x1 -> 24x24x8 -> 12x12x8 -> 8x8x16 -> 4x4x16 -> 256 -> 10.
 MNIST_CNN = [("conv2d", 1, 8, 5, "ReLU"), ("max_pool2d", 2), ("conv2d", 8, 16, 5, "ReLU"),
              ("max_pool2d", 2), ("flatten",), ("dense", 256, 10, "Softmax")]
+PADDED_CNN = [("conv2d", 3, 6, 3, "ReLU", 1, 1), ("conv2d", 6, 8, 3, "Tanh", 2, 1),
+              ("conv2d", 8, 4, 2, "Sigmoid", 2, 0), ("flatten",), ("dense", 16, 3, "Softmax")]
 
 CASES = [
     Case("xor_f64", "f64", dense_layers([2, 4, 1], ["Tanh", "Sigmoid"]), "Binary_Cross_Entropy",
@@ -118,6 +130,12 @@ CASES = [
     Case("odd_cnn_f64", "f64", [("conv2d", 3, 4, 3, "Tanh"), ("max_pool2d", 2), ("conv2d", 4, 5, 2, "Sigmoid"),
                                 ("flatten",), ("dense", 30, 3, "Identity")], "Mean_Squared_Error",
          ("sgd", 0.05, 0.9), batch=16, input_shape=[11, 9, 3]),
+    # 9x8x3 -> 9x8x6 -> 5x4x8 -> 2x2x4: padding keeps the size, then strided
+    # windows start in the padding, and the last convolution's stride drops a
+    # row.
+    Case("strided_cnn_f64", "f64", PADDED_CNN, "Mean_Squared_Error", ("sgd", 0.05, 0.9),
+         batch=16, input_shape=[9, 8, 3]),
+    Case("strided_cnn_f32", "f32", PADDED_CNN, "Cross_Entropy", ADAM, batch=16, input_shape=[9, 8, 3]),
 ]
 
 
@@ -166,7 +184,10 @@ def write_case(case, directory, parameters, x, y, threads):
     lines = [f"dtype {case.dtype}", f"threads {threads}"]
     if case.layers[0][0] != "dense":
         lines.append("input " + " ".join(map(str, case.input_shape)))
-    lines += [" ".join(map(str, layer)) for layer in case.layers]
+    for layer in case.layers:
+        if layer[0] == "conv2d":
+            layer = layer[:4] + conv_geometry(layer) + (activation_of(layer),)
+        lines.append(" ".join(map(str, layer)))
     lines.append(f"loss {case.loss}")
     kind, *params = case.optimizer
     if kind == "sgd":
@@ -195,7 +216,8 @@ def torch_forward(case, params, x, logits, stats, training):
             h = h @ w + b  # weights are [in, out], as in odin-ann
         elif kind == "conv2d":
             w, b = params[i]
-            h = F.conv2d(h, w.permute(3, 2, 0, 1), b)
+            stride, padding = conv_geometry(layer)
+            h = F.conv2d(h, w.permute(3, 2, 0, 1), b, stride=stride, padding=padding)
         elif kind == "max_pool2d":
             h = F.max_pool2d(h, layer[1])
         elif kind == "batch_norm":
@@ -205,7 +227,7 @@ def torch_forward(case, params, x, logits, stats, training):
         else:
             h = h.permute(0, 2, 3, 1).flatten(1)  # odin-ann flattens channels last
         if kind in ("dense", "conv2d", "batch_norm") and not (logits and last):
-            h = torch_activation(layer[-1], h, dim=1 if h.dim() == 4 else -1)
+            h = torch_activation(activation_of(layer), h, dim=1 if h.dim() == 4 else -1)
     return h
 
 

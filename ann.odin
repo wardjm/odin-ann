@@ -57,7 +57,8 @@ Activation :: enum {
 Layer_Kind :: enum {
 	// Fully connected: [features] -> [outputs].
 	Dense,
-	// Valid, stride-1 convolution over [height, width, channels] samples.
+	// Convolution over [height, width, channels] samples, with a stride and
+	// zero padding.
 	Conv2D,
 	// Non-overlapping max pooling over [height, width, channels] samples.
 	Max_Pool2D,
@@ -87,6 +88,9 @@ Layer :: struct($T: typeid) {
 	weights:          tensor.Tensor(T), // Dense: [input_features, output_features]; Conv2D: [kernel, kernel, input_channels, output_channels]; Batch_Norm: the scale, [features]
 	bias:             tensor.Tensor(T), // Dense: [output_features]; Conv2D: [output_channels]; Batch_Norm: the shift, [features]
 	activation:       Activation,
+	// stride and padding are a Conv2D layer's.
+	stride:           int,
+	padding:          int,
 	// pool_size is a Max_Pool2D window's side, which is also its stride.
 	pool_size:        int,
 	// rate is the fraction of values a Dropout layer zeroes while training.
