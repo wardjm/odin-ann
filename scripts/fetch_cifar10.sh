@@ -12,6 +12,17 @@ url=https://www.cs.toronto.edu/~kriz/cifar-10-binary.tar.gz
 md5=c32a1d4ab5d03f1284b67883e8d87530
 files=(data_batch_1.bin data_batch_2.bin data_batch_3.bin data_batch_4.bin data_batch_5.bin test_batch.bin batches.meta.txt)
 
+# md5_matches FILE SUM succeeds if FILE exists and has MD5 sum SUM. It uses
+# md5sum where present, and macOS's md5 otherwise.
+md5_matches() {
+	[ -f "$1" ] || return 1
+	if command -v md5sum > /dev/null; then
+		echo "$2  $1" | md5sum --check --status
+	else
+		[ "$(md5 -q "$1")" = "$2" ]
+	fi
+}
+
 mkdir -p "$dir"
 missing=0
 for name in "${files[@]}"; do
@@ -23,10 +34,10 @@ if [ "$missing" = 0 ]; then
 fi
 
 archive="$dir/cifar-10-binary.tar.gz"
-if ! { [ -f "$archive" ] && echo "$md5  $archive" | md5sum --check --status; }; then
+if ! md5_matches "$archive" "$md5"; then
 	echo "fetching cifar-10-binary.tar.gz"
 	curl --fail --silent --show-error --location --output "$archive.part" "$url"
-	if ! echo "$md5  $archive.part" | md5sum --check --status; then
+	if ! md5_matches "$archive.part" "$md5"; then
 		rm -f "$archive.part"
 		echo "checksum mismatch for cifar-10-binary.tar.gz" >&2
 		exit 1
