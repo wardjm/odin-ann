@@ -3,9 +3,9 @@ package ann
 import "base:intrinsics"
 import tensor "../odin-tensor"
 
-// forward evaluates input through every layer. input is [..., features]: a
-// single sample, a [batch, features] matrix, or any number of leading batch
-// axes. The result is [..., output_features] and is owned by the caller.
+// forward runs the network in inference mode. input's trailing axes are the
+// network's input sample shape, and any leading axes are batch axes, which
+// the output keeps. The result is owned by the caller.
 forward :: proc(network: Network($T), input: tensor.Tensor(T), allocator := context.allocator) -> (tensor.Tensor(T), Error) where intrinsics.type_is_float(T) {
 	return _forward(network, tensor.as_view(input), false, allocator)
 }

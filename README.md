@@ -1,22 +1,18 @@
 # odin-ann
 
-A small Odin neural-network library built on the [`odin-tensor`](https://github.com/wardjm/odin-tensor) package. It covers sequential dense and convolutional networks, dropout and batch normalization, five activations, three losses, SGD with momentum and Adam/AdamW, a minibatch training loop, and saving networks to files. Gradients come from the tensor library's reverse-mode autodiff tape.
+A small neural-network library for [Odin](https://odin-lang.org), built on [`odin-tensor`](https://github.com/wardjm/odin-tensor) and its reverse-mode autodiff.
 
-## Features
-
-- Dense layers with Identity, ReLU, Sigmoid, Tanh and Softmax activations, generic over `f32` or `f64`. Weights are drawn from a seeded generator, with He scaling for ReLU and Glorot otherwise.
-- Image layers on channels-last `[height, width, channels]` samples: `conv2d` with a stride and zero padding, non-overlapping `max_pool2d`, nearest-neighbour `upsample2d`, and `flatten` to feed a dense layer.
-- `dropout` and `batch_norm`, which act one way while training and another during inference.
-- `forward` takes a single sample `[features]`, a batch `[batch, features]`, or any number of leading batch axes. A `[2, 5, features]` input gives `[2, 5, outputs]`.
-- Mean-squared error, binary cross-entropy and categorical cross-entropy. The cross-entropy losses work from the final layer's logits, so they stay finite when outputs saturate.
-- `SGD` (optional momentum) and `Adam` (bias-corrected; a nonzero `weight_decay` makes it AdamW), with learning-rate changes between steps.
-- `train_step` for hand-written loops, and `fit` with shuffled or in-order minibatches, a per-epoch callback, and early stopping.
-- `evaluate`, `accuracy`, `predict_classes` and `one_hot`.
-- `save` and `load` store a network's layers and parameters in one compact binary file, so a trained network can be reloaded without the code that built it.
+- Sequential networks of dense, convolution, pooling, upsampling, flatten, dropout and batch-norm layers, in `f32` or `f64`.
+- Identity, ReLU, Sigmoid, Tanh and Softmax activations.
+- Mean-squared error, binary cross-entropy and categorical cross-entropy, with the cross-entropies computed stably from logits.
+- SGD with momentum, and Adam/AdamW.
+- A minibatch `fit` loop with shuffling, a per-epoch callback and early stopping, or `train_step` for your own loop.
+- Saving and loading networks in a compact binary file.
+- Optional multithreading, with identical results for any thread count.
 
 ## Installation
 
-odin-ann imports odin-tensor as `../odin-tensor`, so the two repositories must be checked out next to each other, under those directory names:
+odin-ann imports odin-tensor as `../odin-tensor`, so clone the two repositories next to each other under those names:
 
 ```sh
 mkdir libs && cd libs
@@ -24,9 +20,7 @@ git clone https://github.com/wardjm/odin-ann.git
 git clone https://github.com/wardjm/odin-tensor.git
 ```
 
-Your program must import odin-tensor from that same checkout. odin-ann's API takes and returns `tensor.Tensor` values, so you will need the import. A second copy elsewhere, such as a vendored one, does not work: two packages named `tensor` cannot be in one build, and the compiler stops with `Duplicate declaration of 'package tensor'`.
-
-The simplest way to do this is a collection that points at the directory holding both checkouts:
+Your program needs odin-tensor too, because the API takes and returns `tensor.Tensor` values. Import it from that same checkout. A second copy elsewhere fails with `Duplicate declaration of 'package tensor'`. A collection pointing at `libs` keeps both imports consistent:
 
 ```sh
 odin run my_app -collection:libs=path/to/libs
@@ -37,11 +31,7 @@ import ann "libs:odin-ann"
 import tensor "libs:odin-tensor"
 ```
 
-Relative imports such as `"../libs/odin-ann"` also work, provided both point into the same `libs` directory.
-
 ## Quick start
-
-The directory names contain hyphens, so both imports need explicit names. Replace the paths with the ones your project uses, as described in [Installation](#installation):
 
 ```odin
 package main
@@ -80,40 +70,99 @@ main :: proc() {
 }
 ```
 
+A convolutional classifier for 28×28 grayscale images:
+
+```odin
+build :: proc(network: ^ann.Network(f32)) -> ann.Error {
+    ann.set_input_shape(network, []int{28, 28, 1}) or_return
+    ann.conv2d(network, 1, 16, 3, padding = 1) or_return // 28x28x16
+    ann.batch_norm(network, .ReLU) or_return
+    ann.max_pool2d(network) or_return                    // 14x14x16
+    ann.flatten(network) or_return                       // 3136
+    ann.dropout(network, 0.3) or_return
+    return ann.dense(network, 14*14*16, 10, .Softmax)
+}
+```
+
 ## Examples
 
-Run these from the repository root:
+Run these from the repository root. Each file opens with a comment describing what it shows and the arguments it takes.
 
 | Command | Shows |
 |---|---|
-| `odin run examples/linear_regression` | One linear unit, plain SGD, and a hand-written `train_step` loop. |
-| `odin run examples/xor` | Binary cross-entropy, Adam, `print_summary`, and early stopping from the `on_epoch` callback. |
-| `odin run examples/sine -o:speed` | Regression with shuffled minibatches and a learning-rate schedule set from the callback, plotted as text. |
-| `odin run examples/spirals -o:speed` | Three-class softmax cross-entropy, `one_hot`, `accuracy`, and a decision map from one batched `predict_classes` call. |
-| `odin run examples/mnist -o:speed` | A convolutional network (`conv2d`, `max_pool2d`, `flatten`) on the MNIST digits, with test accuracy from `on_epoch` after each epoch. It saves the trained network to `data/mnist/cnn.bin`, and `-- data/mnist 0` loads that file and tests it instead of training. Run `scripts/fetch_mnist.sh` first to download the data, about 11 MB, into `data/mnist`. Three epochs reach about 98.6% test accuracy, in about 10 seconds on 8 cores or 30 on one. It uses every physical core unless a third argument, after the data directory and epoch count, sets the thread count. |
-| `odin run examples/mnist_deep -o:speed` | A deeper CNN on MNIST: four 3×3 convolutions, each followed by `batch_norm` with ReLU, and `dropout` before the classifier. The learning rate halves after each epoch through `set_learning_rate` in `on_epoch`. Three epochs reach about 99.2% test accuracy, in about 45 seconds on 8 cores or 2¼ minutes on one. It takes the same arguments as `examples/mnist`, which shares its MNIST loading through `examples/mnist/digits`. |
-| `odin run examples/mnist_denoise -o:speed` | A convolutional autoencoder that removes Gaussian noise from the MNIST digits. Strided, padded convolutions shrink each image to 7×7, and `upsample2d` with padded convolutions grows it back. It trains on noisy inputs with the clean images as targets under binary cross-entropy, with fresh noise each epoch drawn from `on_epoch`. Three epochs cut the test images' mean squared error from 0.116 to 0.014, in about 1¼ minutes on 8 cores. It draws noisy test digits beside the network's output and the originals, saves the network to `data/mnist/denoise.bin`, and takes the same arguments as `examples/mnist`. |
-| `odin run examples/cifar10 -o:speed` | A CNN on CIFAR-10's 32×32 colour photos: three padded 3×3 convolutions with `batch_norm` and ReLU, each followed by `max_pool2d`, then `dropout` and a softmax layer. Each epoch trains on a new augmented copy of the images, shifted by up to 4 pixels and mirrored half the time, written from `on_epoch`, which also lowers the learning rate along a cosine. It prints the test set's confusion matrix and saves the network to `data/cifar10/cifar10.bin`. Run `scripts/fetch_cifar10.sh` first to download the data, about 162 MB, into `data/cifar10`. Fifteen epochs reach about 83% test accuracy, in about 7 minutes on 8 cores. It takes the same arguments as `examples/mnist`, with `data/cifar10` as the default directory. |
+| `odin run examples/linear_regression` | Plain SGD with a hand-written `train_step` loop. |
+| `odin run examples/xor` | Binary cross-entropy, Adam, and early stopping from `on_epoch`. |
+| `odin run examples/sine -o:speed` | Regression with shuffled minibatches and a learning-rate schedule. |
+| `odin run examples/spirals -o:speed` | Softmax classification with `one_hot`, `accuracy` and `predict_classes`. |
+| `odin run examples/mnist -o:speed` | A small CNN on MNIST, about 98.6% test accuracy in 3 epochs, plus `save`/`load`. |
+| `odin run examples/mnist_deep -o:speed` | A deeper CNN with batch norm, dropout and learning-rate decay, about 99.2%. |
+| `odin run examples/mnist_denoise -o:speed` | A convolutional denoising autoencoder using strided convolutions and `upsample2d`. |
+| `odin run examples/cifar10 -o:speed` | A CNN on CIFAR-10 with per-epoch data augmentation, about 83% in 15 epochs. |
+
+The MNIST examples need `scripts/fetch_mnist.sh` (about 11 MB) and the CIFAR-10 example needs `scripts/fetch_cifar10.sh` (about 162 MB). Both scripts download into `data/`.
 
 ## API
 
+### Shapes
+
+Image layers use channels-last samples, `[height, width, channels]`. Every procedure that takes data accepts any number of leading batch axes. A single sample, `[batch, ...]` and `[a, b, ...]` all work, and the output keeps the same leading axes. `fit` treats the first axis as the sample index.
+
 ### Errors
 
-Every fallible procedure returns `ann.Error`, a `#shared_nil` union of `tensor.Tensor_Error` and `ann.Ann_Error`, so `err != nil` checks both and `or_return` passes either along. Shape, bounds and allocation failures come from the tensor library (`.Shape_Mismatch`, `.Allocation_Failed`, ...). `Ann_Error` adds `.Empty_Network`, `.Invalid_Hyperparameter`, `.Loss_Activation_Mismatch`, and `.Network_Changed`, which a trainer returns when the network's layers no longer match its optimizer state. Saving and loading add `.Invalid_File`, `.Unsupported_Version`, `.Read_Failed` and `.Write_Failed`.
+Every fallible procedure returns `ann.Error`, a `#shared_nil` union of `tensor.Tensor_Error` and `ann.Ann_Error`. `err != nil` checks both, and `or_return` passes either along.
 
-### Networks
+- Shape, bounds and allocation failures come from odin-tensor: `.Invalid_Shape`, `.Shape_Mismatch`, `.Out_Of_Bounds`, `.Allocation_Failed`, and so on.
+- `Ann_Error` adds:
+  - `.Empty_Network`: the network has no layers.
+  - `.Invalid_Hyperparameter`: a rate, momentum, epoch count or similar is out of range.
+  - `.Loss_Activation_Mismatch`: the loss doesn't match the final activation (see [Losses](#losses)).
+  - `.Network_Changed`: layers were added or reshaped after the trainer's first step.
+  - `.Invalid_File`, `.Unsupported_Version`, `.Read_Failed`, `.Write_Failed`: errors from saving and loading.
 
-- `new_network(T, seed = 0, allocator)` creates an empty `Network(T)` for a float type `T`. `release(&network)` frees it. Treat networks as move-only.
-- `set_input_shape(&network, shape)` fixes the shape of one input sample, such as `[]int{28, 28, 1}`. A network that starts with an image layer needs it; a first `dense` layer sets `[inputs]` itself. Calling it after layers are added returns `.Shape_Mismatch` unless the shape is unchanged.
-- `dense(&network, inputs, outputs, activation = .Identity)` appends a fully connected layer and returns `.Shape_Mismatch` unless its input is `[inputs]`.
-- `conv2d(&network, input_channels, output_channels, kernel_size, activation = .Identity, stride = 1, padding = 0)` appends a convolution with square kernels. `padding` surrounds the image with that many rows and columns of zeros, and the kernels move `stride` pixels at a time, so `[h, w, input_channels]` becomes `[(h+2·padding-kernel_size)/stride+1, (w+2·padding-kernel_size)/stride+1, output_channels]`, rounding down. A 3×3 kernel with `padding = 1` keeps the image's size, and adding `stride = 2` halves it. Weights are `[kernel_size, kernel_size, input_channels, output_channels]` and biases `[output_channels]`.
-- `max_pool2d(&network, pool_size = 2)` takes the maximum of each non-overlapping `pool_size` × `pool_size` window, so `[h, w, c]` becomes `[h/pool_size, w/pool_size, c]`, rounding down. `upsample2d(&network, factor = 2)` repeats each pixel `factor` times along height and width, so `[h, w, c]` becomes `[h·factor, w·factor, c]`; followed by a padded `conv2d`, it lets a decoder grow an image back. `flatten(&network)` turns each sample into one vector in row-major order. None of these has parameters.
-- `dropout(&network, rate)` zeroes each value with probability `rate` while training and scales the rest by `1/(1-rate)`. During inference it passes values through unchanged. `rate` must be in [0, 1).
-- `batch_norm(&network, activation = .Identity, momentum = 0.1, epsilon = 1e-5)` normalizes the last axis: features after a dense layer, channels after a convolution. While training, it uses the batch's mean and variance over every other axis, then applies a trainable scale and shift that start at 1 and 0, held in `weights` and `bias`. Each step also moves `running_mean` and the unbiased `running_variance` `momentum` of the way toward the batch values. During inference it normalizes with those running values instead. This matches PyTorch's `BatchNorm1d` and `BatchNorm2d`. For the usual convolution → batch norm → ReLU order, give the convolution `.Identity` and the batch norm `.ReLU`. The bias of the layer just before a batch norm has no effect, because normalizing subtracts it again.
-- Each `Layer(T)` holds its `kind`, `weights`, `bias`, `activation`, the settings of its kind (`pool_size`, `rate`, `momentum`, `epsilon`), a batch norm's running statistics, and the `input_shape` and `output_shape` of one sample. The parameters are ordinary tensors, so you can set or load them directly.
-- `input_features_of` and `output_features_of` give the last axis of one input or output sample. `parameter_count` and `print_summary` describe a network.
-- `forward(network, input, allocator)` and `forward_views` return a new tensor owned by the caller. The input's trailing axes must match the network's `input_shape`; any leading axes are batch axes, so a batch of MNIST images is `[batch, 28, 28, 1]`. Each dense layer allocates one tensor and applies its bias and activation in place.
-- `activate_in_place` and `softmax_in_place` apply an activation to any tensor. Softmax normalizes over the last axis and subtracts the row maximum first.
+### Building a network
+
+```odin
+network := ann.new_network(f32, seed = 0, allocator = context.allocator)
+defer ann.release(&network)
+```
+
+`Network(T)` owns its parameters. Treat it as move-only and release it once. `seed` makes the initial weights reproducible. The builders draw weights uniformly, with He scaling before ReLU and Glorot scaling otherwise, and start biases at zero.
+
+| Builder | Effect on one sample |
+|---|---|
+| `set_input_shape(&network, shape)` | Sets the input sample shape, such as `[]int{28, 28, 1}`. A network that starts with an image layer needs it, and a first `dense` sets it automatically. |
+| `dense(&network, inputs, outputs, activation = .Identity)` | `[inputs]` → `[outputs]` |
+| `conv2d(&network, in_channels, out_channels, kernel_size, activation = .Identity, stride = 1, padding = 0)` | `[h, w, in_channels]` → `[(h+2p-k)/s+1, (w+2p-k)/s+1, out_channels]` |
+| `max_pool2d(&network, pool_size = 2)` | `[h, w, c]` → `[h/pool_size, w/pool_size, c]` |
+| `upsample2d(&network, factor = 2)` | `[h, w, c]` → `[h·factor, w·factor, c]` (nearest neighbour) |
+| `flatten(&network)` | Any shape → one vector, row-major |
+| `dropout(&network, rate)` | Unchanged. While training, zeroes values with probability `rate` and scales the rest by `1/(1-rate)`. |
+| `batch_norm(&network, activation = .Identity, momentum = 0.1, epsilon = 1e-5)` | Unchanged. Normalizes the last axis (features or channels). |
+
+Each builder checks its input against the previous layer's output and returns `.Shape_Mismatch` if they don't fit. Sizes in the table round down: windows that pass the padded image's edge are dropped, and so are rows or columns that don't fill a pool.
+
+Notes:
+
+- With `conv2d`, a 3×3 kernel and `padding = 1` keep the image size, and `stride = 2` halves it. Weights are `[k, k, in_channels, out_channels]` and biases `[out_channels]`.
+- `batch_norm` follows PyTorch's `BatchNorm1d`/`BatchNorm2d`. While training, it uses the batch's statistics and moves `running_mean` and the unbiased `running_variance` toward them by `momentum`. During inference it uses the running values. Its scale and shift are stored in `weights` and `bias`. For conv → batch norm → ReLU, give the convolution `.Identity` and the batch norm `.ReLU`.
+- `upsample2d` followed by a padded `conv2d` lets a decoder grow an image back.
+
+Each `Layer(T)` in `network.layers` exposes its `kind`, `activation`, `weights` and `bias`, the settings for its kind, and `input_shape` and `output_shape`. Parameters are ordinary tensors that you can read or overwrite.
+
+Other helpers:
+
+- `parameter_count(network)` gives the number of trainable values, and `print_summary(network)` prints one line per layer.
+- `input_features_of(network)` and `output_features_of(network)` give the last axis of one input or output sample.
+
+### Running a network
+
+```odin
+output, err := ann.forward(network, input) // caller releases output
+```
+
+- `forward(network, input, allocator)` runs inference. Dropout passes values through, and batch norm uses its running statistics. The input's trailing axes must equal the network's input shape. `forward_views` takes a `tensor.Tensor_View`.
+- `predict_classes(network, inputs)` returns a `Tensor(int)` holding the argmax of each output.
+- `activate_in_place(&t, activation)` and `softmax_in_place(&t)` apply an activation to any tensor. Softmax works over the last axis.
 
 ### Losses
 
@@ -121,29 +170,53 @@ Every fallible procedure returns `ann.Error`, a `#shared_nil` union of `tensor.T
 |---|---|---|
 | `.Mean_Squared_Error` | any | same shape as the output |
 | `.Binary_Cross_Entropy` | `.Sigmoid` | values in [0, 1] |
-| `.Cross_Entropy` | `.Softmax` | each row a distribution over the last axis, such as `one_hot(T, labels, classes)` |
+| `.Cross_Entropy` | `.Softmax` | rows that are distributions over the last axis, such as `one_hot(T, labels, classes)` |
 
-Each loss averages over the batch. The two cross-entropy losses replace the final activation with a stable formula on its logits: `max(z, 0) - z*y + log(1 + exp(-|z|))` for binary and log-sum-exp for categorical. Any other pairing returns `.Loss_Activation_Mismatch`. `evaluate(network, loss, inputs, targets)` computes the loss without changing anything. It runs the network in inference mode, as `forward` does, so it equals the training loss exactly only for networks without dropout or batch norm. `mean_squared_error(predictions, targets)` works on any two tensors.
+Every loss averages over the batch. The cross-entropy losses work from the final layer's logits, so they stay finite when outputs saturate. Any other pairing returns `.Loss_Activation_Mismatch`.
+
+- `evaluate(network, loss, inputs, targets)` computes the loss in inference mode without changing anything. `evaluate_views` takes views.
+- `mean_squared_error(predictions, targets)` works on any two tensors of the same shape.
 
 ### Training
 
 ```odin
 trainer, err := ann.trainer_init(f32, .Cross_Entropy, ann.adam(learning_rate = 0.01))
 defer ann.trainer_release(&trainer)
+
 loss, step_err := ann.train_step(&trainer, &network, inputs, targets)
+// or
+loss, fit_err := ann.fit(&trainer, &network, inputs, targets, {epochs = 10, batch_size = 64, shuffle = true})
 ```
 
-- `sgd(learning_rate, momentum = 0, weight_decay = 0)` and `adam(learning_rate = 0.001, beta1 = 0.9, beta2 = 0.999, epsilon = 1e-8, weight_decay = 0)` build an `Optimizer`, a union of the `SGD` and `Adam` structs. Weight decay is decoupled: each step scales parameters by `1 - learning_rate*weight_decay`. Out-of-range values return `.Invalid_Hyperparameter` from `trainer_init`.
-- `trainer_init(T, loss, optimizer, allocator, seed = 0)` creates a `Trainer(T)`. `seed` starts the generator that draws dropout masks. The trainer owns one autodiff tape, which it resets and rebuilds every step, and the optimizer's moment buffers, which it creates on the first step. You pass the network to each call instead of storing it in the trainer, so the network can move freely. If you add or reshape layers afterwards, `train_step` returns `.Network_Changed`.
-- `train_step(&trainer, &network, inputs, targets)` runs forward in training mode, then backward and one optimizer update. Training mode means dropout masks values, and batch norm uses batch statistics and updates its running ones. Its result is the loss from before the update. `train_step_views` takes borrowed views. `trainer.steps` counts updates, and `set_learning_rate` changes the step size without resetting the moment buffers.
-- Training and inference run on one thread unless you call odin-tensor's `tensor.set_thread_count(n)`. Matrix products, element-wise work, `im2col` and pooling are then split across `n` threads, forward and backward, with identical results. On 8 cores a 1024-1024-1024 MLP trains about 4.7× faster than on one, the MNIST CNN about 3.6× and the CIFAR-10 CNN about 4.4×.
-- `fit(&trainer, &network, inputs, targets, options)` trains over a dataset whose first axis indexes samples and returns the mean loss of the last epoch. `Fit_Options` sets `epochs`, `batch_size` (0 means the whole dataset), and `shuffle` with `seed`. It also takes `on_epoch(epoch, loss, user_data) -> bool`, which runs after each epoch; returning false stops early. It may change the values, but not the shapes, of `inputs` and `targets`, and the next epoch trains on the new values, which is how to draw fresh noise or augmentation each epoch. In-order batches are zero-copy `slice_view`s of the dataset. Shuffled batches are copied into two reused buffers.
+Optimizers:
+
+- `sgd(learning_rate, momentum = 0, weight_decay = 0)`
+- `adam(learning_rate = 0.001, beta1 = 0.9, beta2 = 0.999, epsilon = 1e-8, weight_decay = 0)` uses bias correction. A nonzero `weight_decay` makes it AdamW.
+
+Both build an `Optimizer`, a union of the `SGD` and `Adam` structs. Weight decay is decoupled, so each step scales parameters by `1 - learning_rate·weight_decay`. Out-of-range values make `trainer_init` return `.Invalid_Hyperparameter`.
+
+Trainer:
+
+- `trainer_init(T, loss, optimizer, allocator, seed = 0)` creates a `Trainer(T)`. `seed` drives the dropout masks. Every call takes the network as an argument, so the network can move between calls.
+- `train_step(&trainer, &network, inputs, targets)` does one forward pass, one backward pass and one optimizer update, and returns the loss from before the update. `train_step_views` takes views, such as minibatch slices.
+- `set_learning_rate(&trainer, rate)` changes the step size for learning-rate schedules and keeps the optimizer state. `trainer.steps` counts updates.
+
+`fit(&trainer, &network, inputs, targets, options)` trains on a dataset whose first axis indexes samples. It returns the mean loss of the last epoch. `Fit_Options` has these fields:
+
+| Field | Meaning |
+|---|---|
+| `epochs` | Number of passes over the data. Must be positive. |
+| `batch_size` | Samples per step. 0 uses the whole dataset. |
+| `shuffle`, `seed` | Draw a new sample order each epoch. In-order batches don't copy any data. |
+| `on_epoch(epoch, loss, user_data) -> bool` | Runs after each epoch. Return `false` to stop early. It may overwrite the values, but not the shapes, of `inputs` and `targets`, for fresh augmentation each epoch. |
+| `user_data` | Passed to `on_epoch`. |
+
+Training mode differs from inference only for dropout and batch norm. For networks without those layers, `evaluate` matches the training loss exactly.
 
 ### Metrics
 
-- `accuracy(predictions, targets)` compares the argmax over the last axis, or thresholds at 0.5 when there is a single output.
-- `predict_classes(network, inputs)` returns a `Tensor(int)` of argmax classes.
-- `one_hot(T, labels, classes)` builds `[len(labels), classes]` targets.
+- `accuracy(predictions, targets)` compares the argmax over the last axis. With a single output per sample, it compares predictions and targets thresholded at 0.5.
+- `one_hot(T, labels, classes)` builds a `[len(labels), classes]` target tensor.
 
 ### Saving and loading
 
@@ -153,48 +226,19 @@ restored := ann.load(f32, "model.bin") or_return
 defer ann.release(&restored)
 ```
 
-- `save(network, path)` writes the network's input shape, each layer's kind, activation and sizes, and its parameters. `load(T, path, seed = 0, allocator)` rebuilds the network with the layer builders and fills in the parameters. `marshal` and `unmarshal` do the same with a byte slice instead of a file.
-- `T` is `f32` or `f64`, and either type loads a file saved from either one. `seed` is used only for weights of layers you add after loading.
-- A file that is truncated, has trailing bytes, or describes layers that do not fit together returns `.Invalid_File`. The size check happens before any parameter memory is allocated, so a corrupt file cannot trigger a huge allocation. A file from a newer format version returns `.Unsupported_Version`.
-- Optimizer state is not saved. Training a loaded network with a new trainer starts Adam's moment estimates from zero.
-- The format is little-endian, and its layout is documented at the top of `save.odin`.
+- `save(network, path)` stores the input shape, the layers and their parameters. `load(T, path, seed = 0, allocator)` rebuilds the network without the code that built it. `seed` is used only for layers you add afterwards.
+- `marshal(network)` and `unmarshal(T, data)` do the same with a byte slice.
+- An `f32` file loads as `f64` and vice versa.
+- Truncated or inconsistent data returns `.Invalid_File` before allocating anything large. A file from a newer format version returns `.Unsupported_Version`.
+- Optimizer state isn't saved, so Adam restarts from zero moments when you train a loaded network. The file layout is documented at the top of `save.odin`.
 
-## How training uses the tape
+### Threads
 
-Each step records the network on the trainer's tape. The input enters as a constant leaf (`tape_add_leaf_view`, no gradient). Every weight and bias enters as a borrowed leaf, and each dense layer becomes `tape_linear` → activation: one node for the product plus bias, whose sums start from the bias. It applies the weights to the last axis, so leading batch axes need no special handling.
+Everything runs on one thread unless you call odin-tensor's `tensor.set_thread_count(n)`. After that, forward and backward passes use `n` threads, and the results are identical for any `n`. On 8 cores, the MNIST CNN trains about 3.6× faster than on one, and the CIFAR-10 CNN about 4.4× faster.
 
-A convolution is `tape_im2col`, which gathers each output position's input window into the last axis of a `[..., out_h, out_w, kernel_size²·input_channels]` tensor, with zeros for positions in the padding, then a single `tape_linear` applying the weights viewed as `[kernel_size²·input_channels, output_channels]`, plus the bias, which gives the output image directly. `forward` computes the same product the same way, so it agrees with training exactly. Max pooling is `tape_max_pool2d`, and `flatten` is a `tape_reshape`. Upsampling views its input as `[images, h, 1, w, 1, c]` and multiplies it by a constant leaf of ones shaped `[factor, 1, factor, 1]`, so broadcasting repeats each pixel exactly and the gradient sums its copies.
+## Performance
 
-Dropout multiplies by a constant leaf of zeros and `1/(1-rate)`. Batch norm records odin-tensor's fused `tape_batch_norm`, which normalizes over every axis but the last and applies the scale and shift, and for a `.ReLU` activation the ReLU as well. Its gradient flows through the batch mean and variance as well, and the operation returns those statistics for the running estimates.
-
-The loss itself is never recorded. Its value and its gradient with respect to the network output are computed directly with tensor kernels. That gradient seeds `tape_backward_with_seed` at the output, or at the final logits for the cross-entropy losses. The fused gradients are `sigmoid(z) - y` and `softmax(z) * sum(y) - y`, computed exactly, without differentiating through `log(sigmoid)`.
-
-A Softmax in a hidden layer, or before mean-squared error, is recorded as `exp(x - max) / sum`. The row maximum enters as a constant leaf, which is exact because softmax ignores a per-row shift.
-
-## Tests
-
-```sh
-odin test . -vet -strict-style -define:ODIN_TEST_FAIL_ON_BAD_MEMORY=true
-```
-
-The tests compare every loss's gradients, including a fused 3-D batch, a hidden softmax, a network using every image layer, and one with batch norm after a convolution and a dense layer plus dropout between them, against central finite differences in `f64`. The finite differences use the training loss with the same dropout masks. Batch norm's normalization, running statistics and inference output are checked against direct formulas. Convolution, pooling and upsampling are also checked against direct loops. They check that `fit` with in-order batches matches hand-sliced `train_step` calls bit for bit. Saved networks are checked for exact round trips across every layer kind and both float types, and every truncation or corrupted header field of a saved file is rejected. A failing allocator drives every `.Allocation_Failed` path through building, training, evaluating, measuring, saving and loading a network, with and without dropout and batch norm, and the define makes any leak a failure.
-
-```sh
-scripts/check_readme.sh
-```
-
-Builds every `odin` block in this README that declares `package main` against both libraries, with `-vet -strict-style`.
-
-## Comparing with PyTorch
-
-```sh
-python3 bench/torch_parity.py                   # every case, one thread
-python3 bench/torch_parity.py cifar --threads 8 # cases matching "cifar"
-```
-
-This needs Python with PyTorch. Each case, from XOR up to the CIFAR-10 network, draws a random network, inputs and targets, trains for a few steps in both libraries from the same weights, and reports the largest relative difference in the forward output, each step's loss and the final parameters. The tolerances are 1e-9 for `f64` and 1e-4 for `f32`, looser for the CIFAR-10 network in `f32`, whose summation order matters more, as the script explains. The `f64` cases agree to 1e-13 or better. The script then compares the median time of a forward pass and of one `train_step`.
-
-Training step times on a Ryzen 7 2700X with PyTorch 2.11, pinned with `taskset -c 0-7` for 8 threads:
+Measured training step times against PyTorch 2.11 on a Ryzen 7 2700X, with the same networks and weights:
 
 | Case | odin-ann, 1 thread | PyTorch, 1 thread | odin-ann, 8 threads | PyTorch, 8 threads |
 |---|---|---|---|---|
@@ -202,3 +246,13 @@ Training step times on a Ryzen 7 2700X with PyTorch 2.11, pinned with `taskset -
 | CIFAR-10 CNN, `f64` | 231 ms | 255 ms | 63 ms | 82 ms |
 | MNIST CNN, `f32` | 9.4 ms | 5.7 ms | 2.6 ms | 2.4 ms |
 | 1024-1024-1024 MLP, `f32` | 55 ms | 54 ms | 11.6 ms | 12.3 ms |
+
+The same harness checks that outputs, losses and trained parameters agree with PyTorch. See [DEVELOPMENT.md](DEVELOPMENT.md).
+
+## Development
+
+[DEVELOPMENT.md](DEVELOPMENT.md) covers running the tests, how training records networks on the autodiff tape, and the PyTorch comparison.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

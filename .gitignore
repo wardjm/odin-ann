@@ -1,7 +1,16 @@
-# Build outputs
+# Build outputs. `odin build examples/xor` writes ./xor; building from inside
+# an example's directory writes it there.
 *.bin
 /torch_parity
 /bench/torch_parity/torch_parity
+/linear_regression
+/sine
+/spirals
+/xor
+/mnist
+/mnist_deep
+/mnist_denoise
+/cifar10
 /examples/*/linear_regression
 /examples/*/sine
 /examples/*/spirals
@@ -11,6 +20,6 @@
 /examples/*/mnist_denoise
 /examples/*/cifar10
 
-# Downloaded datasets (scripts/fetch_mnist.sh)
+# Downloaded datasets (scripts/fetch_mnist.sh, scripts/fetch_cifar10.sh)
 /data/
 __pycache__/

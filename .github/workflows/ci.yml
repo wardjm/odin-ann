@@ -29,7 +29,6 @@ jobs:
         with:
           repository: wardjm/odin-tensor
           path: odin-tensor
-          ssh-key: ${{ secrets.ODIN_TENSOR_DEPLOY_KEY }}
 
       - name: Restore Odin
         id: odin-cache

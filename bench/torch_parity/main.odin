@@ -7,10 +7,11 @@
 // spec.txt describes the network as builder calls: an optional "input h w c"
 // line, then "dense in out activation", "conv2d in_channels out_channels
 // kernel stride padding activation", "max_pool2d size", "upsample2d factor",
-// "flatten" and "batch_norm features activation" lines in order. Weights and biases, a batch norm's scale and
-// shift, are read and written as w<i>.bin and b<i>.bin, where i is the
-// layer's index; layers without parameters have none. A batch norm's running
-// mean and variance are written as m<i>.bin and v<i>.bin after training.
+// "flatten" and "batch_norm features activation" lines in order. Weights and
+// biases, a batch norm's scale and shift, are read and written as w<i>.bin and
+// b<i>.bin, where i is the layer's index; layers without parameters have none.
+// A batch norm's running mean and variance are written as m<i>.bin and
+// v<i>.bin after training.
 //
 // The program loads the network and data, writes the forward output, the loss
 // from every training step and the final parameters, then times forward and

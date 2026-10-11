@@ -104,9 +104,9 @@ _record_dropout :: proc(tape: ^tensor.Tape($T), layer: Layer(T), input: tensor.T
 }
 
 // _record_batch_norm records tensor.tape_batch_norm, which normalizes input
-// with its own statistics over every axis but the last and applies the scale
-// and shift, and with relu the ReLU too. It updates the running statistics when training asks
-// for it.
+// with its own statistics over every axis but the last, applies the scale and
+// shift, and applies a ReLU when relu is set. It updates the running
+// statistics when training asks for it.
 _record_batch_norm :: proc(tape: ^tensor.Tape($T), layer: Layer(T), input, scale, shift: tensor.Tape_Value(T), training: _Training, relu := false) -> (output: tensor.Tape_Value(T), err: Error) where intrinsics.type_is_float(T) {
 	features := len(layer.weights.data)
 	statistics: []T

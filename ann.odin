@@ -41,8 +41,8 @@ Error :: union #shared_nil {
 	Ann_Error,
 }
 
-// Activation is applied after a dense layer's affine transform. Softmax
-// normalizes over the last axis. Saved networks store these by value, so add
+// Activation is applied to a Dense, Conv2D or Batch_Norm layer's output.
+// Softmax normalizes over the last axis. Saved networks store these by value, so add
 // new members at the end.
 Activation :: enum {
 	Identity,
@@ -165,12 +165,12 @@ set_input_shape :: proc(network: ^Network($T), shape: []int) -> Error {
 	return nil
 }
 
-// dense appends a fully connected layer. Its input must be a vector of
-// input_features: [input_features] is the network's input shape or the
-// preceding layer's output, or the network has no input shape yet and this
-// sets it. Weights are drawn uniformly with He scaling for
-// ReLU and Glorot scaling otherwise; biases start at zero. The parameters are
-// ordinary tensors, so callers may overwrite them.
+// dense appends a fully connected layer. Its input must be [input_features]:
+// the network's input shape, the preceding layer's output, or, for a first
+// layer with no input shape set, the input shape this sets. Weights are drawn
+// uniformly with He scaling for ReLU and Glorot scaling otherwise; biases
+// start at zero. The parameters are ordinary tensors, so callers may
+// overwrite them.
 dense :: proc(network: ^Network($T), input_features, output_features: int, activation := Activation.Identity) -> Error where intrinsics.type_is_float(T) {
 	if input_features <= 0 || output_features <= 0 {
 		return .Invalid_Shape

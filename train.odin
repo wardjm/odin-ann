@@ -27,10 +27,12 @@ Optimizer :: union {
 	Adam,
 }
 
+// sgd builds an SGD optimizer.
 sgd :: proc(learning_rate: f64, momentum := 0.0, weight_decay := 0.0) -> Optimizer {
 	return SGD{learning_rate = learning_rate, momentum = momentum, weight_decay = weight_decay}
 }
 
+// adam builds an Adam optimizer, or AdamW with a nonzero weight_decay.
 adam :: proc(learning_rate := 0.001, beta1 := 0.9, beta2 := 0.999, epsilon := 1e-8, weight_decay := 0.0) -> Optimizer {
 	return Adam{learning_rate = learning_rate, beta1 = beta1, beta2 = beta2, epsilon = epsilon, weight_decay = weight_decay}
 }
@@ -102,9 +104,10 @@ set_learning_rate :: proc(trainer: ^Trainer($T), learning_rate: f64) -> Error {
 	return nil
 }
 
-// train_step runs one forward and backward pass over a batch and updates every
-// parameter. inputs is [..., input_features] and targets must have the shape
-// of the network's output. Returns the loss measured before the update.
+// train_step runs one forward and backward pass over a batch in training mode
+// and updates every parameter. inputs is shaped as for forward, and targets
+// must have the shape of the network's output. Returns the loss measured
+// before the update.
 train_step :: proc(trainer: ^Trainer($T), network: ^Network(T), inputs, targets: tensor.Tensor(T)) -> (T, Error) where intrinsics.type_is_float(T) {
 	return train_step_views(trainer, network, tensor.as_view(inputs), tensor.as_view(targets))
 }
@@ -123,6 +126,7 @@ evaluate :: proc(network: Network($T), loss: Loss, inputs, targets: tensor.Tenso
 	return evaluate_views(network, loss, tensor.as_view(inputs), tensor.as_view(targets), allocator)
 }
 
+// evaluate_views is evaluate for borrowed views.
 evaluate_views :: proc(network: Network($T), loss: Loss, inputs, targets: tensor.Tensor_View(T), allocator := context.allocator) -> (value: T, err: Error) where intrinsics.type_is_float(T) {
 	_check_loss(network, loss) or_return
 	prediction := _forward(network, inputs, _loss_uses_logits(loss), allocator) or_return
@@ -402,8 +406,8 @@ Fit_Options :: struct {
 	user_data:  rawptr,
 }
 
-// fit trains on a dataset whose first axis indexes samples: inputs is
-// [samples, ..., input_features] and targets [samples, ..., output_features].
+// fit trains on a dataset whose first axis indexes samples, so inputs is
+// [samples, ...input sample shape] and targets [samples, ...output shape].
 // Returns the mean training loss of the last epoch run.
 fit :: proc(trainer: ^Trainer($T), network: ^Network(T), inputs, targets: tensor.Tensor(T), options: Fit_Options) -> (epoch_loss: f64, err: Error) where intrinsics.type_is_float(T) {
 	if options.epochs <= 0 || options.batch_size < 0 {
