@@ -85,6 +85,12 @@ MNIST_CNN = [("conv2d", 1, 8, 5, "ReLU"), ("max_pool2d", 2), ("conv2d", 8, 16, 5
              ("max_pool2d", 2), ("flatten",), ("dense", 256, 10, "Softmax")]
 AUTOENCODER = [("conv2d", 1, 4, 3, "ReLU", 2, 1), ("conv2d", 4, 8, 3, "ReLU", 2, 1), ("upsample2d", 2),
                ("conv2d", 8, 4, 3, "ReLU", 1, 1), ("upsample2d", 2), ("conv2d", 4, 1, 3, "Sigmoid", 1, 1)]
+# examples/cifar10 without its dropout, whose masks cannot match: 32x32x3 ->
+# 16x16x32 -> 8x8x64 -> 4x4x128 -> 10.
+CIFAR10_CNN = [("conv2d", 3, 32, 3, "Identity", 1, 1), ("batch_norm", 32, "ReLU"), ("max_pool2d", 2),
+               ("conv2d", 32, 64, 3, "Identity", 1, 1), ("batch_norm", 64, "ReLU"), ("max_pool2d", 2),
+               ("conv2d", 64, 128, 3, "Identity", 1, 1), ("batch_norm", 128, "ReLU"), ("max_pool2d", 2),
+               ("flatten",), ("dense", 2048, 10, "Softmax")]
 PADDED_CNN = [("conv2d", 3, 6, 3, "ReLU", 1, 1), ("conv2d", 6, 8, 3, "Tanh", 2, 1),
               ("conv2d", 8, 4, 2, "Sigmoid", 2, 0), ("flatten",), ("dense", 16, 3, "Softmax")]
 
@@ -140,6 +146,16 @@ CASES = [
     Case("strided_cnn_f32", "f32", PADDED_CNN, "Cross_Entropy", ADAM, batch=16, input_shape=[9, 8, 3]),
     # examples/mnist_denoise's shape at a smaller size: 12x12x1 -> 6x6x4 ->
     # 3x3x8 -> 6x6x8 -> 6x6x4 -> 12x12x4 -> 12x12x1.
+    # SGD, since each convolution bias feeds batch normalization directly (see
+    # the batch norm cases above). The f64 case checks the parameters exactly;
+    # in f32, each convolution weight's gradient sums 65536 positions whose
+    # terms batch normalization makes cancel, so the libraries' different
+    # summation orders leave relative differences of 5e-4 to 1e-3, depending on
+    # PyTorch's thread count.
+    Case("cifar10_cnn_f64", "f64", CIFAR10_CNN, "Cross_Entropy", ("sgd", 0.01, 0.9),
+         batch=64, input_shape=[32, 32, 3], steps=3, fwd_reps=3, train_reps=3),
+    Case("cifar10_cnn_f32", "f32", CIFAR10_CNN, "Cross_Entropy", ("sgd", 0.01, 0.9),
+         batch=64, input_shape=[32, 32, 3], steps=3, fwd_reps=10, train_reps=10, tolerance=3e-3),
     Case("autoencoder_f64", "f64", AUTOENCODER, "Binary_Cross_Entropy", ADAM, batch=16,
          input_shape=[12, 12, 1], output_shape=[12, 12, 1]),
 ]
