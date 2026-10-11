@@ -6,8 +6,8 @@
 //
 // spec.txt describes the network as builder calls: an optional "input h w c"
 // line, then "dense in out activation", "conv2d in_channels out_channels
-// kernel stride padding activation", "max_pool2d size", "flatten" and
-// "batch_norm features activation" lines in order. Weights and biases, a batch norm's scale and
+// kernel stride padding activation", "max_pool2d size", "upsample2d factor",
+// "flatten" and "batch_norm features activation" lines in order. Weights and biases, a batch norm's scale and
 // shift, are read and written as w<i>.bin and b<i>.bin, where i is the
 // layer's index; layers without parameters have none. A batch norm's running
 // mean and variance are written as m<i>.bin and v<i>.bin after training.
@@ -43,7 +43,7 @@ Spec :: struct {
 
 // Layer_Spec holds one builder call. sizes are dense's inputs and outputs,
 // conv2d's input channels, output channels, kernel size, stride and padding,
-// max_pool2d's pool size, or batch_norm's features.
+// max_pool2d's pool size, upsample2d's factor, or batch_norm's features.
 Layer_Spec :: struct {
 	kind:       ann.Layer_Kind,
 	sizes:      [5]int,
@@ -104,6 +104,8 @@ run :: proc($T: typeid, dir: string, spec: Spec) -> ann.Error {
 			if len(network.layers[i].weights.data) != layer.sizes[0] {
 				return .Shape_Mismatch
 			}
+		case .Upsample2D:
+			ann.upsample2d(&network, layer.sizes[0]) or_return
 		case .Dropout:
 			return .Invalid_Hyperparameter // masks cannot match PyTorch's
 		}
@@ -120,7 +122,11 @@ run :: proc($T: typeid, dir: string, spec: Spec) -> ann.Error {
 	inputs := tensor.new_tensor(T, input_shape[:]) or_return
 	defer tensor.release(&inputs)
 	load_into(dir, "x.bin", inputs.data) or_return
-	targets := tensor.new_tensor(T, []int{spec.batch, ann.output_features_of(network)}) or_return
+	output_sample := network.layers[len(network.layers)-1].output_shape
+	target_shape := make([dynamic]int, context.temp_allocator)
+	append(&target_shape, spec.batch)
+	append(&target_shape, ..output_sample.dims[:output_sample.rank])
+	targets := tensor.new_tensor(T, target_shape[:]) or_return
 	defer tensor.release(&targets)
 	load_into(dir, "y.bin", targets.data) or_return
 
@@ -230,6 +236,8 @@ parse_spec :: proc(dir: string) -> (spec: Spec, ok: bool) {
 			append(&spec.layers, layer)
 		case "max_pool2d":
 			append(&spec.layers, Layer_Spec{kind = .Max_Pool2D, sizes = {0 = atoi(f[1])}})
+		case "upsample2d":
+			append(&spec.layers, Layer_Spec{kind = .Upsample2D, sizes = {0 = atoi(f[1])}})
 		case "flatten":
 			append(&spec.layers, Layer_Spec{kind = .Flatten})
 		case "loss":

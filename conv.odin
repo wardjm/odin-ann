@@ -72,6 +72,27 @@ max_pool2d :: proc(network: ^Network($T), pool_size := 2) -> Error where intrins
 	return _append_layer(network, Layer(T){kind = .Max_Pool2D, pool_size = pool_size, input_shape = input_shape, output_shape = output_shape})
 }
 
+// upsample2d appends nearest-neighbour upsampling, which repeats each pixel
+// factor times along height and width, so [height, width, channels] becomes
+// [height·factor, width·factor, channels]. Followed by a padded convolution,
+// it lets a decoder grow an image back to full size. Each output's gradient
+// goes to the pixel it repeats.
+upsample2d :: proc(network: ^Network($T), factor := 2) -> Error where intrinsics.type_is_float(T) {
+	if factor <= 0 {
+		return .Invalid_Shape
+	}
+	input_shape := _current_shape(network^)
+	if input_shape.rank != 3 {
+		return .Shape_Mismatch
+	}
+	height, width, channels := input_shape.dims[0], input_shape.dims[1], input_shape.dims[2]
+	if height > max(int)/factor || width > max(int)/factor {
+		return .Invalid_Shape
+	}
+	output_shape := _sample_shape(height*factor, width*factor, channels)
+	return _append_layer(network, Layer(T){kind = .Upsample2D, factor = factor, input_shape = input_shape, output_shape = output_shape})
+}
+
 // flatten appends a layer that reshapes each sample into one vector in
 // row-major order, so [h, w, c] becomes [h*w*c].
 flatten :: proc(network: ^Network($T)) -> Error where intrinsics.type_is_float(T) {
@@ -90,13 +111,9 @@ flatten :: proc(network: ^Network($T)) -> Error where intrinsics.type_is_float(T
 // the windows merged into [positions, kernel²·input_channels] rows, and the
 // output with input's batch axes.
 _conv2d_shapes :: proc(layer: Layer($T), input_shape: []int, rows_buffer: ^[2]int, output_buffer: []int) -> (rows, output: []int) {
-	height_axis := len(input_shape) - 3
 	columns := len(layer.weights.data) / layer.weights.shape[3]
 	rows_buffer^ = {-1, columns}
-	copy(output_buffer, input_shape[:height_axis])
-	sample := layer.output_shape
-	copy(output_buffer[height_axis:], _sample_dims(&sample))
-	return rows_buffer[:], output_buffer[:height_axis+3]
+	return rows_buffer[:], _image_output_shape(layer, input_shape, output_buffer)
 }
 
 // _conv2d_forward computes a Conv2D layer's output before its activation.
@@ -144,6 +161,67 @@ _max_pool2d_forward :: proc(layer: Layer($T), input: tensor.Tensor_View(T), allo
 
 _record_max_pool2d :: proc(tape: ^tensor.Tape($T), layer: Layer(T), input: tensor.Tape_Value(T)) -> (output: tensor.Tape_Value(T), err: Error) where intrinsics.type_is_float(T) {
 	return tensor.tape_max_pool2d(tape, input, layer.pool_size, layer.pool_size)
+}
+
+// _image_output_shape writes input's batch axes followed by an image layer's
+// output sample shape into buffer.
+_image_output_shape :: proc(layer: Layer($T), input_shape: []int, buffer: []int) -> []int {
+	height_axis := len(input_shape) - 3
+	copy(buffer, input_shape[:height_axis])
+	sample := layer.output_shape
+	copy(buffer[height_axis:], _sample_dims(&sample))
+	return buffer[:height_axis+3]
+}
+
+// _upsample2d_forward writes each input row's pixels factor times each, then
+// copies that output row factor-1 more times.
+_upsample2d_forward :: proc(layer: Layer($T), input: tensor.Tensor_View(T), allocator := context.allocator) -> (output: tensor.Tensor(T), err: Error) where intrinsics.type_is_float(T) {
+	source := tensor.copy_view(input, allocator) or_return
+	defer tensor.release(&source)
+	shape_buffer: [tensor.MAX_RANK]int
+	output = tensor.new_tensor(T, _image_output_shape(layer, input.shape, shape_buffer[:]), allocator) or_return
+	factor := layer.factor
+	width, channels := layer.input_shape.dims[1], layer.input_shape.dims[2]
+	input_row := width * channels
+	output_row := input_row * factor
+	next := 0
+	for start := 0; start < len(source.data); start += input_row {
+		row := output.data[next:][:output_row]
+		for x in 0..<width {
+			pixel := source.data[start + x*channels:][:channels]
+			for copy_index in 0..<factor {
+				copy(row[(x*factor + copy_index)*channels:][:channels], pixel)
+			}
+		}
+		for copy_index in 1..<factor {
+			copy(output.data[next + copy_index*output_row:][:output_row], row)
+		}
+		next += factor * output_row
+	}
+	return output, nil
+}
+
+// _record_upsample2d views input as [images, height, 1, width, 1, channels]
+// and multiplies it by ones broadcast to [factor, 1, factor, 1], which
+// repeats every pixel exactly; the product's gradient sums each pixel's
+// copies.
+_record_upsample2d :: proc(tape: ^tensor.Tape($T), layer: Layer(T), input: tensor.Tape_Value(T)) -> (output: tensor.Tape_Value(T), err: Error) where intrinsics.type_is_float(T) {
+	value := tensor.tape_value(tape, input) or_return
+	height, width, channels := layer.input_shape.dims[0], layer.input_shape.dims[1], layer.input_shape.dims[2]
+	images := 1
+	for dim in value.shape[:len(value.shape)-3] {
+		images *= dim
+	}
+	factor := layer.factor
+	ones := tensor.new_tensor(T, []int{factor, 1, factor, 1}, tape.allocator) or_return
+	defer tensor.release(&ones)
+	tensor.fill(&ones, 1)
+	ones_leaf := tensor.tape_add_leaf_copy(tape, tensor.as_view(ones), false) or_return
+
+	split := tensor.tape_reshape(tape, input, []int{images, height, 1, width, 1, channels}) or_return
+	repeated := tensor.tape_mul(tape, split, ones_leaf) or_return
+	shape_buffer: [tensor.MAX_RANK]int
+	return tensor.tape_reshape(tape, repeated, _image_output_shape(layer, value.shape, shape_buffer[:]))
 }
 
 // _flatten_shape writes input's batch axes followed by the layer's flattened

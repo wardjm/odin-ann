@@ -117,6 +117,65 @@ test_max_pool2d_takes_window_maxima_and_drops_remainders :: proc(t: ^testing.T) 
 }
 
 @(test)
+test_upsample2d_repeats_pixels :: proc(t: ^testing.T) {
+	network := new_network(f64)
+	defer release(&network)
+	require_ok(t, set_input_shape(&network, []int{2, 3, 2}))
+	require_ok(t, upsample2d(&network, 3))
+	expect_shape(t, _sample_dims(&network.layers[0].output_shape), []int{6, 9, 2})
+	testing.expect_value(t, parameter_count(network), 0)
+
+	// Two images, behind an extra batch axis.
+	inputs := pseudo_tensor(t, []int{1, 2, 2, 3, 2}, 1)
+	defer tensor.release(&inputs)
+	output, err := forward(network, inputs)
+	require_ok(t, err)
+	defer tensor.release(&output)
+	expect_shape(t, output.shape, []int{1, 2, 6, 9, 2})
+	for n in 0..<2 do for y in 0..<6 do for x in 0..<9 do for c in 0..<2 {
+		testing.expect_value(t, output.data[((n*6 + y)*9 + x)*2 + c], inputs.data[((n*2 + y/3)*3 + x/3)*2 + c])
+	}
+
+	// Training records the same values, and each pixel's gradient is the sum
+	// over its nine copies.
+	trainer, trainer_err := trainer_init(f64, .Mean_Squared_Error, sgd(0))
+	require_ok(t, trainer_err)
+	defer trainer_release(&trainer)
+	tape := &trainer.tape
+	input, input_err := tensor.tape_add_leaf_view(tape, tensor.as_view(inputs))
+	require_ok(t, input_err)
+	recorded, record_err := _record_forward(tape, network, input, &trainer.parameters, false, _Training{rng = &trainer.rng})
+	require_ok(t, record_err)
+	recorded_value, value_err := tensor.tape_value(tape, recorded)
+	require_ok(t, value_err)
+	expect_shape(t, recorded_value.shape, output.shape)
+	for value, i in recorded_value.data[recorded_value.offset:][:len(output.data)] {
+		testing.expect_value(t, value, output.data[i])
+	}
+	seed, seed_err := tensor.new_tensor(f64, output.shape)
+	require_ok(t, seed_err)
+	defer tensor.release(&seed)
+	for &value, i in seed.data {
+		value = f64(i)
+	}
+	require_ok(t, tensor.tape_backward_with_seed(tape, recorded, seed))
+	gradient, gradient_err := tensor.tape_gradient(tape, input)
+	require_ok(t, gradient_err)
+	for n in 0..<2 do for y in 0..<2 do for x in 0..<3 do for c in 0..<2 {
+		want: f64
+		for dy in 0..<3 do for dx in 0..<3 {
+			want += f64(((n*6 + y*3+dy)*9 + x*3+dx)*2 + c)
+		}
+		testing.expect_value(t, gradient.data[gradient.offset + ((n*2 + y)*3 + x)*2 + c], want)
+	}
+
+	expect_error(t, upsample2d(&network, 0), Tensor_Error.Invalid_Shape)
+	expect_error(t, upsample2d(&network, max(int)/4), Tensor_Error.Invalid_Shape)
+	require_ok(t, flatten(&network))
+	expect_error(t, upsample2d(&network), Tensor_Error.Shape_Mismatch)
+}
+
+@(test)
 test_flatten_keeps_row_major_order :: proc(t: ^testing.T) {
 	network := new_network(f32)
 	defer release(&network)
@@ -180,16 +239,18 @@ test_image_layers_validate_shapes :: proc(t: ^testing.T) {
 }
 
 // build_image_classifier is a small network using every image layer: a 7x7
-// input leaves a remainder row and column for the pool to drop, and the
-// convolutions use padding and a stride.
+// input leaves a remainder row and column for the pool to drop, the
+// convolutions use padding and a stride, and upsampling repeats the last
+// convolution's pixels.
 build_image_classifier :: proc(t: ^testing.T, seed: u64) -> Network(f64) {
 	network := new_network(f64, seed)
 	require_ok(t, set_input_shape(&network, []int{7, 7, 2}))
 	require_ok(t, conv2d(&network, 2, 3, 3, .Tanh, padding = 1))            // 7x7x3
 	require_ok(t, max_pool2d(&network, 2))                                  // 3x3x3
 	require_ok(t, conv2d(&network, 3, 2, 2, .Tanh, stride = 2, padding = 1)) // 2x2x2
+	require_ok(t, upsample2d(&network))                                     // 4x4x2
 	require_ok(t, flatten(&network))
-	require_ok(t, dense(&network, 8, 3, .Softmax))
+	require_ok(t, dense(&network, 32, 3, .Softmax))
 	for &layer in network.layers {
 		copy(layer.bias.data, pseudo_values(len(layer.bias.data), 0.3))
 	}
@@ -286,8 +347,9 @@ image_allocation_scenario :: proc(allocator: mem.Allocator) -> Error {
 	set_input_shape(&network, []int{5, 5, 1}) or_return
 	conv2d(&network, 1, 2, 2, .ReLU) or_return
 	max_pool2d(&network) or_return
+	upsample2d(&network) or_return
 	flatten(&network) or_return
-	dense(&network, 8, 2, .Softmax) or_return
+	dense(&network, 32, 2, .Softmax) or_return
 	inputs := tensor.from_slice(f64, pseudo_values(3*25, 1), []int{3, 5, 5, 1}, allocator) or_return
 	defer tensor.release(&inputs)
 	targets := one_hot(f64, []int{0, 1, 1}, 2, allocator) or_return

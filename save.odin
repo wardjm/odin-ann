@@ -22,6 +22,7 @@ import "core:os"
 //         Flatten     nothing more
 //         Dropout     f64 rate
 //         Batch_Norm  u32 features, f64 momentum, f64 epsilon
+//         Upsample2D  u32 factor
 //         then the weights, bias, running mean and running variance that the
 //         layer has, each in row-major order
 //
@@ -88,6 +89,8 @@ marshal :: proc(network: Network($T), allocator := context.allocator) -> (data: 
 			_put_u32(&writer, len(layer.weights.data))
 			_put_f64(&writer, layer.momentum)
 			_put_f64(&writer, layer.epsilon)
+		case .Upsample2D:
+			_put_u32(&writer, layer.factor)
 		}
 		for values in _layer_values(layer) {
 			_put_floats(&writer, values)
@@ -179,6 +182,8 @@ _unmarshal_into :: proc(network: ^Network($T), data: []byte) -> Error {
 			if build_err == nil && len(network.layers[len(network.layers)-1].weights.data) != features {
 				return .Invalid_File
 			}
+		case .Upsample2D:
+			build_err = upsample2d(network, _get_u32(&reader) or_return)
 		}
 		_file_error(build_err) or_return
 		for stored in _layer_values(network.layers[len(network.layers)-1]) {
@@ -229,6 +234,7 @@ _layer_settings_size :: proc(kind: Layer_Kind) -> int {
 	case .Flatten:    return 0
 	case .Dropout:    return 8
 	case .Batch_Norm: return 20
+	case .Upsample2D: return 4
 	}
 	return 0
 }

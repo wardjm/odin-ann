@@ -32,8 +32,8 @@ ROOT = Path(__file__).resolve().parent.parent
 
 # Layers mirror odin-ann's builders: ("dense", inputs, outputs, activation),
 # ("conv2d", in_channels, out_channels, kernel, activation), optionally
-# followed by stride and padding, ("max_pool2d", size), ("flatten",) and
-# ("batch_norm", features, activation). Image samples
+# followed by stride and padding, ("max_pool2d", size), ("upsample2d",
+# factor), ("flatten",) and ("batch_norm", features, activation). Image samples
 # are channels-last [h, w, c], as in odin-ann; PyTorch's half converts to and
 # from its channels-first layout. Batch normalization uses odin-ann's
 # defaults, momentum 0.1 and epsilon 1e-5, which are also PyTorch's.
@@ -62,6 +62,8 @@ class Case:
     batch: int
     # One sample's shape; [features] of the first dense layer if omitted.
     input_shape: list = None
+    # One output sample's shape; [outputs] of the last dense layer if omitted.
+    output_shape: list = None
     steps: int = 20
     fwd_reps: int = 50
     train_reps: int = 20
@@ -73,16 +75,16 @@ class Case:
             self.tolerance = 1e-9 if self.dtype == "f64" else 1e-4
         if self.input_shape is None:
             self.input_shape = [self.layers[0][1]]
-
-    @property
-    def outputs(self):
-        return next(layer[2] for layer in reversed(self.layers) if layer[0] == "dense")
+        if self.output_shape is None:
+            self.output_shape = [next(layer[2] for layer in reversed(self.layers) if layer[0] == "dense")]
 
 
 ADAM = ("adam", 1e-3, 0.9, 0.999, 1e-8, 0.0)
 # examples/mnist: 28x28x1 -> 24x24x8 -> 12x12x8 -> 8x8x16 -> 4x4x16 -> 256 -> 10.
 MNIST_CNN = [("conv2d", 1, 8, 5, "ReLU"), ("max_pool2d", 2), ("conv2d", 8, 16, 5, "ReLU"),
              ("max_pool2d", 2), ("flatten",), ("dense", 256, 10, "Softmax")]
+AUTOENCODER = [("conv2d", 1, 4, 3, "ReLU", 2, 1), ("conv2d", 4, 8, 3, "ReLU", 2, 1), ("upsample2d", 2),
+               ("conv2d", 8, 4, 3, "ReLU", 1, 1), ("upsample2d", 2), ("conv2d", 4, 1, 3, "Sigmoid", 1, 1)]
 PADDED_CNN = [("conv2d", 3, 6, 3, "ReLU", 1, 1), ("conv2d", 6, 8, 3, "Tanh", 2, 1),
               ("conv2d", 8, 4, 2, "Sigmoid", 2, 0), ("flatten",), ("dense", 16, 3, "Softmax")]
 
@@ -136,6 +138,10 @@ CASES = [
     Case("strided_cnn_f64", "f64", PADDED_CNN, "Mean_Squared_Error", ("sgd", 0.05, 0.9),
          batch=16, input_shape=[9, 8, 3]),
     Case("strided_cnn_f32", "f32", PADDED_CNN, "Cross_Entropy", ADAM, batch=16, input_shape=[9, 8, 3]),
+    # examples/mnist_denoise's shape at a smaller size: 12x12x1 -> 6x6x4 ->
+    # 3x3x8 -> 6x6x8 -> 6x6x4 -> 12x12x4 -> 12x12x1.
+    Case("autoencoder_f64", "f64", AUTOENCODER, "Binary_Cross_Entropy", ADAM, batch=16,
+         input_shape=[12, 12, 1], output_shape=[12, 12, 1]),
 ]
 
 
@@ -167,13 +173,13 @@ def make_data(case, rng):
         parameters[i] = (rng.uniform(-limit, limit, shape).astype(np_dtype),
                          rng.uniform(-0.1, 0.1, shape[-1]).astype(np_dtype))
     x = rng.standard_normal([case.batch] + case.input_shape).astype(np_dtype)
-    outputs = case.outputs
+    y_shape = [case.batch] + case.output_shape
     if case.loss == "Cross_Entropy":
-        y = np.eye(outputs, dtype=np_dtype)[rng.integers(0, outputs, case.batch)]
+        y = np.eye(y_shape[-1], dtype=np_dtype)[rng.integers(0, y_shape[-1], case.batch)]
     elif case.loss == "Binary_Cross_Entropy":
-        y = rng.integers(0, 2, (case.batch, outputs)).astype(np_dtype)
+        y = rng.integers(0, 2, y_shape).astype(np_dtype)
     else:
-        y = rng.standard_normal((case.batch, outputs)).astype(np_dtype)
+        y = rng.standard_normal(y_shape).astype(np_dtype)
     if case.name.startswith("xor"):
         x = np.array([[0, 0], [0, 1], [1, 0], [1, 1]], dtype=np_dtype)
         y = np.array([[0], [1], [1], [0]], dtype=np_dtype)
@@ -217,9 +223,11 @@ def torch_forward(case, params, x, logits, stats, training):
         elif kind == "conv2d":
             w, b = params[i]
             stride, padding = conv_geometry(layer)
-            h = F.conv2d(h, w.permute(3, 2, 0, 1), b, stride=stride, padding=padding)
+            h = F.conv2d(h, w.permute(3, 2, 0, 1).contiguous(), b, stride=stride, padding=padding)
         elif kind == "max_pool2d":
             h = F.max_pool2d(h, layer[1])
+        elif kind == "upsample2d":
+            h = F.interpolate(h, scale_factor=layer[1], mode="nearest")
         elif kind == "batch_norm":
             w, b = params[i]
             mean, variance = stats[i]
@@ -228,7 +236,7 @@ def torch_forward(case, params, x, logits, stats, training):
             h = h.permute(0, 2, 3, 1).flatten(1)  # odin-ann flattens channels last
         if kind in ("dense", "conv2d", "batch_norm") and not (logits and last):
             h = torch_activation(activation_of(layer), h, dim=1 if h.dim() == 4 else -1)
-    return h
+    return h.permute(0, 2, 3, 1) if h.dim() == 4 else h  # back to channels last
 
 
 def torch_loss(case, params, x, y, stats):

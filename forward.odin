@@ -56,6 +56,8 @@ _layer_forward :: proc(layer: Layer($T), input: tensor.Tensor_View(T), allocator
 		return _dropout_forward(input, allocator)
 	case .Batch_Norm:
 		return _batch_norm_forward(layer, input, allocator)
+	case .Upsample2D:
+		return _upsample2d_forward(layer, input, allocator)
 	}
 	return output, nil
 }

@@ -70,6 +70,8 @@ Layer_Kind :: enum {
 	// Normalizes each feature, the last axis, over the batch while training,
 	// and with running statistics otherwise.
 	Batch_Norm,
+	// Nearest-neighbour upsampling of [height, width, channels] samples.
+	Upsample2D,
 }
 
 // MAX_SAMPLE_RANK bounds the rank of one sample's shape, such as [features]
@@ -84,7 +86,8 @@ Sample_Shape :: struct {
 
 Layer :: struct($T: typeid) {
 	kind:             Layer_Kind,
-	// weights and bias are empty for Max_Pool2D, Flatten and Dropout.
+	// weights and bias are empty for Max_Pool2D, Flatten, Dropout and
+	// Upsample2D.
 	weights:          tensor.Tensor(T), // Dense: [input_features, output_features]; Conv2D: [kernel, kernel, input_channels, output_channels]; Batch_Norm: the scale, [features]
 	bias:             tensor.Tensor(T), // Dense: [output_features]; Conv2D: [output_channels]; Batch_Norm: the shift, [features]
 	activation:       Activation,
@@ -93,6 +96,9 @@ Layer :: struct($T: typeid) {
 	padding:          int,
 	// pool_size is a Max_Pool2D window's side, which is also its stride.
 	pool_size:        int,
+	// factor is how many times an Upsample2D layer repeats each pixel along
+	// each axis.
+	factor:           int,
 	// rate is the fraction of values a Dropout layer zeroes while training.
 	rate:             f64,
 	// A Batch_Norm layer's running estimates of each feature's mean and
@@ -138,7 +144,7 @@ release :: proc(network: ^Network($T)) {
 }
 
 // set_input_shape fixes the shape of one input sample, such as
-// []int{28, 28, 1} for a grayscale image. Conv2D, Max_Pool2D and Flatten need
+// []int{28, 28, 1} for a grayscale image. The image layers and Flatten need
 // it when they come first; a first Dense layer sets it itself. It must be
 // called before any layer is added, or with the shape the network already
 // has; otherwise it returns Shape_Mismatch.
@@ -235,7 +241,7 @@ _layer_parameters :: proc(layer: ^Layer($T), buffer: ^[2]^tensor.Tensor(T)) -> [
 	case .Dense, .Conv2D, .Batch_Norm:
 		buffer^ = {&layer.weights, &layer.bias}
 		return buffer[:]
-	case .Max_Pool2D, .Flatten, .Dropout:
+	case .Max_Pool2D, .Flatten, .Dropout, .Upsample2D:
 	}
 	return nil
 }

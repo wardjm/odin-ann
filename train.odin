@@ -193,6 +193,8 @@ _record_layer :: proc(tape: ^tensor.Tape($T), layer: Layer(T), input: tensor.Tap
 		output = _record_dropout(tape, layer, input, training) or_return
 	case .Batch_Norm:
 		output = _record_batch_norm(tape, layer, input, parameters[0], parameters[1], training) or_return
+	case .Upsample2D:
+		output = _record_upsample2d(tape, layer, input) or_return
 	}
 	return output, nil
 }
@@ -389,7 +391,10 @@ Fit_Options :: struct {
 	shuffle:    bool,
 	seed:       u64,
 	// on_epoch, when set, runs after each epoch with the sample-weighted mean
-	// training loss of that epoch. Returning false stops training early.
+	// training loss of that epoch. Returning false stops training early. It
+	// may change the values, but not the shapes, of the inputs and targets
+	// passed to fit; the next epoch trains on the new values, which is how to
+	// draw fresh noise or augmentation each epoch.
 	on_epoch:   proc(epoch: int, loss: f64, user_data: rawptr) -> bool,
 	user_data:  rawptr,
 }

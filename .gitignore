@@ -8,6 +8,7 @@
 /examples/*/xor
 /examples/*/mnist
 /examples/*/mnist_deep
+/examples/*/mnist_denoise
 
 # Downloaded datasets (scripts/fetch_mnist.sh)
 /data/
