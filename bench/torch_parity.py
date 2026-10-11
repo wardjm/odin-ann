@@ -144,10 +144,9 @@ CASES = [
     Case("strided_cnn_f64", "f64", PADDED_CNN, "Mean_Squared_Error", ("sgd", 0.05, 0.9),
          batch=16, input_shape=[9, 8, 3]),
     Case("strided_cnn_f32", "f32", PADDED_CNN, "Cross_Entropy", ADAM, batch=16, input_shape=[9, 8, 3]),
-    # examples/mnist_denoise's shape at a smaller size: 12x12x1 -> 6x6x4 ->
-    # 3x3x8 -> 6x6x8 -> 6x6x4 -> 12x12x4 -> 12x12x1.
-    # SGD, since each convolution bias feeds batch normalization directly (see
-    # the batch norm cases above). The f64 case checks the parameters exactly;
+    # examples/cifar10's network on 64 images. SGD, since each convolution
+    # bias feeds batch normalization directly (see the batch norm cases
+    # above). The f64 case checks the parameters exactly;
     # in f32, each convolution weight's gradient sums 65536 positions whose
     # terms batch normalization makes cancel, so the libraries' different
     # summation orders leave relative differences of 5e-4 to 1e-3, depending on
@@ -156,6 +155,8 @@ CASES = [
          batch=64, input_shape=[32, 32, 3], steps=3, fwd_reps=3, train_reps=3),
     Case("cifar10_cnn_f32", "f32", CIFAR10_CNN, "Cross_Entropy", ("sgd", 0.01, 0.9),
          batch=64, input_shape=[32, 32, 3], steps=3, fwd_reps=10, train_reps=10, tolerance=3e-3),
+    # examples/mnist_denoise's shape at a smaller size: 12x12x1 -> 6x6x4 ->
+    # 3x3x8 -> 6x6x8 -> 6x6x4 -> 12x12x4 -> 12x12x1.
     Case("autoencoder_f64", "f64", AUTOENCODER, "Binary_Cross_Entropy", ADAM, batch=16,
          input_shape=[12, 12, 1], output_shape=[12, 12, 1]),
 ]
